@@ -1,9 +1,27 @@
+# --- Python ---
 venv/
 .venv/
 __pycache__/
 *.pyc
-data/*.db
+.pytest_cache/
+*.egg-info/
+
+# --- Secrets / local config: never commit these ---
 .env
+.env.*
+!.env.example
+
+# --- Generated data (each person regenerates it) ---
+data/*.db
+data/cache/
+
+# --- Cloned scan targets: every contributor clones their own (see scripts/) ---
 test_repos/*
 !test_repos/.gitkeep
-.pytest_cache/
+
+# --- Editors / OS ---
+.idea/
+.vscode/*
+!.vscode/settings.json
+.DS_Store
+Thumbs.db

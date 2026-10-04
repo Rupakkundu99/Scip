@@ -1,0 +1,5 @@
+# Normalise line endings so Windows / Linux / macOS contributors don't fight over them
+* text=auto
+# Shell scripts must stay LF or they break on Linux/macOS; .bat files need CRLF on Windows
+*.sh  text eol=lf
+*.bat text eol=crlf
