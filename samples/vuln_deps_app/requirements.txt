@@ -1,0 +1,13 @@
+# Intentionally OUTDATED pins - used to test the dependency engine.
+# Do not install these in a real project.
+Django==2.2.0
+Flask==0.12.2
+requests==2.19.0
+PyYAML==3.13
+Jinja2==2.10
+urllib3==1.24.1
+Pillow==6.2.0
+cryptography==2.3
+
+# loose spec -> engine should report it as "not pinned" and skip it
+numpy>=1.0

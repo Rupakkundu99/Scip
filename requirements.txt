@@ -1,0 +1,10 @@
+gitpython
+requests
+networkx
+typer
+pytest
+pyyaml
+fastapi
+uvicorn
+radon
+packaging
