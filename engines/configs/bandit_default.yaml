@@ -1,0 +1,14 @@
+# SCIP default Bandit configuration
+# Focuses on high-impact, high-confidence security flaws in Python codebases.
+
+skips:
+  - B101  # assert_used (noisy in defensive programming and test suites)
+
+# Exclude virtual environments and build directories
+exclude_dirs:
+  - venv
+  - .venv
+  - env
+  - node_modules
+  - .tox
+  - .git
