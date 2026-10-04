@@ -6,17 +6,21 @@ and dangerous built-ins.
 """
 from __future__ import annotations
 
-import json
+import importlib.util
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 from core.finding import Finding
-from engines.base import Engine
+from core.taxonomy import normalize_cwe
+from engines.base import Engine, rel_path
+
+_rel_path = rel_path
 
 log = logging.getLogger("scip.bandit")
 
@@ -39,21 +43,16 @@ COMMON_FIX_HINTS: Dict[str, str] = {
     "B603": "Ensure arguments passed to subprocess are strictly validated or use an allowlist.",
     "B608": "Use parameterized SQL queries with placeholders instead of string formatting or concatenation.",
     "B324": "Specify usedforsecurity=False if hashing with MD5/SHA1 strictly for non-cryptographic checksums.",
-    "B377": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp().",
+    "B306": "Use tempfile.NamedTemporaryFile() or mkstemp() instead of deprecated, race-prone mktemp().",
 }
+
+SKIP_DIRS = {".git", ".hg", "venv", ".venv", "node_modules", "__pycache__", ".tox"}
 
 
 def _calculate_severity(issue_sev: str, issue_conf: str) -> float:
     base = SEV_MAP.get(issue_sev.upper(), 5.0)
     adjust = CONF_ADJUST.get(issue_conf.upper(), 0.0)
     return round(max(1.0, min(10.0, base + adjust)), 1)
-
-
-def _rel_path(path: str, root: Path) -> str:
-    try:
-        return Path(path).resolve().relative_to(root.resolve()).as_posix()
-    except (ValueError, OSError):
-        return Path(path).as_posix()
 
 
 class BanditEngine(Engine):
@@ -67,14 +66,35 @@ class BanditEngine(Engine):
         severity_min: Optional[str] = None,
         confidence_min: Optional[str] = None,
         timeout: int = TIMEOUT,
+        include_suppressed: bool = False,
     ):
-        self.config_file = config_file or (str(DEFAULT_CONFIG) if DEFAULT_CONFIG.exists() else None)
+        if config_file:
+            self.config_file = str(Path(config_file).resolve())
+        elif DEFAULT_CONFIG.exists():
+            self.config_file = str(DEFAULT_CONFIG.resolve())
+        else:
+            self.config_file = None
         self.tests = tests
         self.skips = skips
         self.severity_min = severity_min
         self.confidence_min = confidence_min
         self.timeout = timeout
+        self.include_suppressed = include_suppressed
         self.stats: Dict[str, Any] = {}
+
+    def is_available(self) -> bool:
+        """Check if Bandit is installed in current Python environment or on PATH."""
+        return importlib.util.find_spec("bandit") is not None or shutil.which("bandit") is not None
+
+    def _has_python_files(self, root: Path) -> bool:
+        for p in root.rglob("*.py"):
+            try:
+                rel_parts = p.relative_to(root).parts
+            except ValueError:
+                rel_parts = p.parts
+            if not any(part in SKIP_DIRS for part in rel_parts):
+                return True
+        return False
 
     def scan(self, repo_path: str) -> List[Finding]:
         root = Path(repo_path).resolve()
@@ -91,14 +111,25 @@ class BanditEngine(Engine):
             self.stats["errors"].append("Directory does not exist")
             return []
 
-        # Check if there are any python files to scan
-        py_files = list(root.glob("**/*.py"))
-        if not py_files:
+        if not self.is_available():
+            log.warning("Bandit is not installed in the environment. Skipping Bandit engine.")
+            self.stats.update(skipped=True, note="Bandit package not found")
+            return []
+
+        # Fast check if there are any non-ignored Python files to scan
+        if not self._has_python_files(root):
             log.info("No Python files found under %s", root)
             self.stats["files_scanned"] = 0
             return []
 
-        cmd = [sys.executable, "-m", "bandit", "-r", str(root), "-f", "json"]
+        # Run via current Python environment module if available, otherwise fallback to PATH executable
+        if importlib.util.find_spec("bandit") is not None:
+            cmd = [sys.executable, "-m", "bandit", "-r", "-f", "json"]
+        elif shutil.which("bandit") is not None:
+            cmd = ["bandit", "-r", "-f", "json"]
+        else:
+            self.stats.update(skipped=True, note="Bandit executable not found")
+            return []
 
         if self.config_file and os.path.exists(self.config_file):
             cmd.extend(["-c", str(self.config_file)])
@@ -106,19 +137,28 @@ class BanditEngine(Engine):
             cmd.extend(["-t", ",".join(self.tests)])
         if self.skips:
             cmd.extend(["-s", ",".join(self.skips)])
+            self.stats["skipped_rules"] = list(self.skips)
         if self.severity_min:
-            flag = {"low": "-l", "medium": "-m", "high": "-h"}.get(self.severity_min.lower())
+            flag = {"low": "-l", "medium": "-ll", "high": "-lll"}.get(self.severity_min.lower())
             if flag:
                 cmd.append(flag)
         if self.confidence_min:
             flag = {"low": "-i", "medium": "-ii", "high": "-iii"}.get(self.confidence_min.lower())
             if flag:
                 cmd.append(flag)
+        if self.include_suppressed:
+            cmd.append("--ignore-nosec")
 
-        log.info("Running Bandit: %s", " ".join(cmd))
+        # Pass target path with '--' to prevent flag injection.
+        # Run with cwd=root and relative target '.' to prevent parent directories (e.g. /env/)
+        # from inadvertently matching exclude_dirs substrings.
+        cmd.extend(["--", "."])
+
+        log.info("Running Bandit: %s (cwd=%s)", " ".join(cmd), root)
         try:
             proc = subprocess.run(
                 cmd,
+                cwd=str(root),
                 capture_output=True,
                 encoding="utf-8",
                 errors="replace",
@@ -133,29 +173,23 @@ class BanditEngine(Engine):
             self.stats["errors"].append(str(e))
             return []
 
-        # Bandit returns code 0 (no issues) or 1 (issues found). Other codes indicate failure.
-        if proc.returncode not in (0, 1):
-            err_msg = proc.stderr.strip()[:300] or f"Exit code {proc.returncode}"
-            log.warning("Bandit process exited with error: %s", err_msg)
+        data = self._load_json(proc.stdout)
+        if data is None:
+            err_msg = proc.stderr.strip()[:300] or f"exit code {proc.returncode}, no JSON"
+            log.warning("Bandit execution failed: %s", err_msg)
             self.stats["errors"].append(err_msg)
             return []
 
-        return self._parse_output(proc.stdout, root)
+        return self._parse_output(data, root)
 
-    def _parse_output(self, stdout: str, root: Path) -> List[Finding]:
-        if not stdout or "{" not in stdout:
-            return []
-
-        json_start = stdout.find("{")
-        json_end = stdout.rfind("}")
-        if json_start == -1 or json_end == -1:
-            return []
-
-        try:
-            data = json.loads(stdout[json_start : json_end + 1])
-        except json.JSONDecodeError as e:
-            log.warning("Failed to parse Bandit JSON output: %s", e)
-            self.stats["errors"].append(f"JSON parse error: {e}")
+    def _parse_output(self, data_or_stdout: Any, root: Path) -> List[Finding]:
+        if isinstance(data_or_stdout, str):
+            data = self._load_json(data_or_stdout)
+            if data is None:
+                return []
+        elif isinstance(data_or_stdout, dict):
+            data = data_or_stdout
+        else:
             return []
 
         metrics = data.get("metrics", {})
@@ -165,6 +199,12 @@ class BanditEngine(Engine):
             loc=totals.get("loc", 0),
             nosec=totals.get("nosec", 0),
         )
+
+        # Capture Bandit file/syntax errors into engine stats
+        for err in data.get("errors", []):
+            filename = err.get("filename", "unknown")
+            reason = err.get("reason", "error")
+            self.stats["errors"].append(f"{filename}: {reason}"[:200])
 
         results = data.get("results", [])
         findings: List[Finding] = []
@@ -179,21 +219,23 @@ class BanditEngine(Engine):
     def _make_finding(self, r: Dict[str, Any], root: Path) -> Finding:
         test_id = r.get("test_id", "UNKNOWN")
         test_name = r.get("test_name", "")
-        raw_text = r.get("issue_text", "")
-        summary = raw_text.split(".")[0] if raw_text else test_name
+        raw_text = (r.get("issue_text") or "").strip()
+        # Sentence splitting using regex instead of naive '.'
+        sentences = re.split(r"\.\s+", raw_text)
+        summary = sentences[0] if sentences and sentences[0] else test_name
         issue_sev = r.get("issue_severity", "MEDIUM")
         issue_conf = r.get("issue_confidence", "MEDIUM")
 
         severity = _calculate_severity(issue_sev, issue_conf)
 
-        # CWE Extraction
+        # CWE Extraction using canonical taxonomy mapping
         cwe_data = r.get("issue_cwe") or {}
-        cwe_id = cwe_data.get("id")
-        cwe_str = f"CWE-{cwe_id}" if cwe_id else None
+        raw_cwe_id = cwe_data.get("id")
+        cwe_str = normalize_cwe(raw_cwe_id, test_id=test_id)
 
         # File & Line
         raw_filename = r.get("filename", "")
-        rel_file = _rel_path(raw_filename, root)
+        normalized_file = rel_path(raw_filename, root)
         line = r.get("line_number")
 
         # Exploitability heuristic based on severity and confidence
@@ -213,7 +255,7 @@ class BanditEngine(Engine):
         return Finding(
             engine=self.name,
             title=f"Bandit {test_id}: {summary}",
-            file=rel_file,
+            file=normalized_file,
             line=line,
             cwe=cwe_str,
             severity=severity,

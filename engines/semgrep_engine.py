@@ -5,18 +5,18 @@ rulesets) to detect OWASP Top 10 vulnerabilities, framework misconfigurations,
 insecure deserialization, and injection patterns.
 """
 from __future__ import annotations
-
-import json
 import logging
-import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from core.finding import Finding
-from engines.base import Engine
+from core.taxonomy import normalize_cwe
+from engines.base import Engine, rel_path
+
+_rel_path = rel_path
 
 log = logging.getLogger("scip.semgrep")
 
@@ -44,15 +44,31 @@ def _extract_cwe(metadata: Dict[str, Any]) -> Optional[str]:
         target = str(raw_cwe[0])
     else:
         target = str(raw_cwe)
-    m = re.search(r"CWE-(\d+)", target, re.I)
-    return f"CWE-{m.group(1)}" if m else None
+    return normalize_cwe(target)
 
 
-def _rel_path(path: str, root: Path) -> str:
+def _clean_check_id(check_id: str) -> str:
+    """Strip local path prefix from Semgrep check IDs (e.g. engines.rules.semgrep.scip...)."""
+    m = re.search(r"(scip\.[A-Za-z0-9._-]+)", check_id)
+    if m:
+        return m.group(1)
+    if "rules." in check_id:
+        return check_id.split("rules.", 1)[-1]
+    return check_id
+
+
+def _read_source_snippet(file_path: Path, start_line: Optional[int], end_line: Optional[int]) -> str:
+    """Read the snippet directly from the source file when Semgrep OSS redacts extra.lines."""
+    if not start_line or not file_path.exists() or not file_path.is_file():
+        return ""
     try:
-        return Path(path).resolve().relative_to(root.resolve()).as_posix()
-    except (ValueError, OSError):
-        return Path(path).as_posix()
+        raw = file_path.read_text(encoding="utf-8-sig", errors="replace")
+        lines = raw.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        s = max(0, start_line - 1)
+        e = min(len(lines), end_line or start_line)
+        return "\n".join(lines[s:e]).strip()
+    except OSError:
+        return ""
 
 
 class SemgrepEngine(Engine):
@@ -64,20 +80,19 @@ class SemgrepEngine(Engine):
         timeout: int = TIMEOUT,
         max_target_bytes: int = 1_000_000,
         exclude_dirs: Optional[List[str]] = None,
+        include_suppressed: bool = False,
     ):
-        """Initialize SemgrepEngine.
-
-        Args:
-            rules_path: Path to custom YAML rule file/dir, or Semgrep preset (e.g. 'p/python').
-                        If None, uses SCIP default rules.
-            timeout: Subprocess timeout in seconds.
-            max_target_bytes: Max file size in bytes to analyze (skips larger files).
-            exclude_dirs: Directories to exclude from scan.
-        """
-        self.rules_path = rules_path or (str(DEFAULT_RULES) if DEFAULT_RULES.exists() else None)
+        if rules_path:
+            p = Path(rules_path)
+            self.rules_path = str(p.resolve()) if p.exists() else str(rules_path)
+        elif DEFAULT_RULES.exists():
+            self.rules_path = str(DEFAULT_RULES.resolve())
+        else:
+            self.rules_path = None
         self.timeout = timeout
         self.max_target_bytes = max_target_bytes
         self.exclude_dirs = exclude_dirs or [".git", "venv", ".venv", "node_modules", ".tox"]
+        self.include_suppressed = include_suppressed
         self.stats: Dict[str, Any] = {}
 
     def is_available(self) -> bool:
@@ -117,14 +132,19 @@ class SemgrepEngine(Engine):
             str(self.rules_path),
             "--json",
             "--quiet",
+            "--metrics=off",
+            "--disable-version-check",
             "--max-target-bytes",
             str(self.max_target_bytes),
         ]
+        if self.include_suppressed:
+            cmd.append("--disable-nosem")
 
         for exc in self.exclude_dirs:
             cmd.extend(["--exclude", exc])
 
-        cmd.append(str(root))
+        # Use '--' to guard target path
+        cmd.extend(["--", str(root)])
 
         log.info("Running Semgrep with config: %s", self.rules_path)
         try:
@@ -144,29 +164,23 @@ class SemgrepEngine(Engine):
             self.stats["errors"].append(str(e))
             return []
 
-        # Semgrep returns 0 on success (with or without findings), or 1 on blocking findings depending on flags
-        if proc.returncode not in (0, 1) and not proc.stdout:
-            err = proc.stderr.strip()[:300] or f"Exit code {proc.returncode}"
+        data = self._load_json(proc.stdout)
+        if data is None:
+            err = proc.stderr.strip()[:300] or f"exit code {proc.returncode}, no JSON"
             log.warning("Semgrep execution failed: %s", err)
             self.stats["errors"].append(err)
             return []
 
-        return self._parse_output(proc.stdout, root)
+        return self._parse_output(data, root)
 
-    def _parse_output(self, stdout: str, root: Path) -> List[Finding]:
-        if not stdout or "{" not in stdout:
-            return []
-
-        json_start = stdout.find("{")
-        json_end = stdout.rfind("}")
-        if json_start == -1 or json_end == -1:
-            return []
-
-        try:
-            data = json.loads(stdout[json_start : json_end + 1])
-        except json.JSONDecodeError as e:
-            log.warning("Failed to decode Semgrep JSON: %s", e)
-            self.stats["errors"].append(f"JSON decode error: {e}")
+    def _parse_output(self, data_or_stdout: Any, root: Path) -> List[Finding]:
+        if isinstance(data_or_stdout, str):
+            data = self._load_json(data_or_stdout)
+            if data is None:
+                return []
+        elif isinstance(data_or_stdout, dict):
+            data = data_or_stdout
+        else:
             return []
 
         raw_results = data.get("results", [])
@@ -175,6 +189,11 @@ class SemgrepEngine(Engine):
             files_scanned=len(paths_scanned),
             rules_skipped=len(data.get("skipped_rules", [])),
         )
+
+        # Capture Semgrep rule or file syntax errors into engine stats
+        for err in data.get("errors", []):
+            msg = err.get("message") or err.get("spans", [{}])[0].get("file") or str(err)
+            self.stats["errors"].append(str(msg)[:200])
 
         findings: List[Finding] = []
         for r in raw_results:
@@ -185,11 +204,12 @@ class SemgrepEngine(Engine):
         return findings
 
     def _make_finding(self, r: Dict[str, Any], root: Path) -> Finding:
-        check_id = r.get("check_id", "semgrep.rule")
+        raw_check_id = r.get("check_id", "semgrep.rule")
+        check_id = _clean_check_id(raw_check_id)
         short_id = check_id.split(".")[-1]
 
         extra = r.get("extra", {})
-        message = extra.get("message", "Semgrep security finding").strip()
+        message = (extra.get("message") or "Semgrep security finding").strip()
         metadata = extra.get("metadata", {})
         raw_sev = extra.get("severity", "WARNING").upper()
 
@@ -199,12 +219,16 @@ class SemgrepEngine(Engine):
         cwe = _extract_cwe(metadata)
 
         raw_path = r.get("path", "")
-        rel_file = _rel_path(raw_path, root)
+        normalized_file = rel_path(raw_path, root)
         start = r.get("start", {})
+        end = r.get("end", {})
         line = start.get("line")
+        end_line = end.get("line") or line
+        line_range = list(range(line, end_line + 1)) if line else []
 
-        # Summary title
-        first_sentence = message.split(".")[0] if message else check_id
+        # First sentence splitting using regex
+        sentences = re.split(r"\.\s+", message)
+        first_sentence = sentences[0] if sentences and sentences[0] else check_id
         title = f"Semgrep {short_id}: {first_sentence}"
 
         # Fix hint
@@ -214,13 +238,24 @@ class SemgrepEngine(Engine):
         else:
             fix_hint = f"Review rule {check_id} and refactor code to remediate this issue."
 
-        # Evidence
-        evidence = (extra.get("lines") or "").strip()
+        # Evidence: handle "requires login" redaction in Semgrep OSS
+        raw_lines = extra.get("lines")
+        if raw_lines and raw_lines != "requires login":
+            evidence = raw_lines.strip()
+        else:
+            # Read snippet directly from file
+            target_file = root / normalized_file
+            evidence = _read_source_snippet(target_file, line, end.get("line"))
+
+        # Fingerprint: drop placeholder "requires login"
+        fingerprint = extra.get("fingerprint")
+        if fingerprint == "requires login":
+            fingerprint = None
 
         return Finding(
             engine=self.name,
             title=title,
-            file=rel_file,
+            file=normalized_file,
             line=line,
             cwe=cwe,
             severity=severity,
@@ -234,8 +269,9 @@ class SemgrepEngine(Engine):
                 "confidence": metadata.get("confidence", "MEDIUM"),
                 "owasp": metadata.get("owasp"),
                 "references": metadata.get("references", []),
-                "fingerprint": extra.get("fingerprint"),
+                "fingerprint": fingerprint,
                 "start": start,
-                "end": r.get("end", {}),
+                "end": end,
+                "line_range": line_range,
             },
         )

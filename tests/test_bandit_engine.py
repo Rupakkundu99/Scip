@@ -1,6 +1,7 @@
 """Tests for BanditEngine."""
 import json
 from pathlib import Path
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -99,7 +100,7 @@ def test_parse_canned_bandit_output(tmp_path):
     assert "hashlib.sha256" in findings[0].fix_hint
 
     assert findings[1].file == "app.py"
-    assert findings[1].cwe == "CWE-20"
+    assert findings[1].cwe == "CWE-502"
     assert findings[1].severity == 5.5
     assert "yaml.safe_load" in findings[1].fix_hint
     assert engine.stats["findings_count"] == 2
@@ -129,6 +130,7 @@ def test_bandit_target_not_found():
 # --------------------------------------------------------------------------- #
 # Integration-level test on synthetic Python file
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not BanditEngine().is_available(), reason="Bandit not installed")
 def test_bandit_real_scan_synthetic(tmp_path):
     py_file = tmp_path / "vuln.py"
     py_file.write_text(
@@ -153,7 +155,78 @@ def test_bandit_real_scan_synthetic(tmp_path):
 def test_bandit_handles_timeout(tmp_path):
     (tmp_path / "sample.py").write_text("print('hello')", encoding="utf-8")
     engine = BanditEngine(timeout=1)
-    with patch("subprocess.run", side_effect=pytest.importorskip("subprocess").TimeoutExpired(cmd="bandit", timeout=1)):
+    with patch.object(engine, "is_available", return_value=True), patch(
+        "subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="bandit", timeout=1)
+    ):
         findings = engine.scan(str(tmp_path))
         assert findings == []
         assert any("Timed out" in e for e in engine.stats.get("errors", []))
+
+
+def test_bandit_non_json_output_records_error(tmp_path):
+    (tmp_path / "sample.py").write_text("print('hello')", encoding="utf-8")
+    engine = BanditEngine()
+    mock_proc = MagicMock(returncode=1, stdout="", stderr="ModuleNotFoundError: No module named 'bandit'")
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run", return_value=mock_proc):
+        findings = engine.scan(str(tmp_path))
+        assert findings == []
+        assert len(engine.stats["errors"]) >= 1
+        assert "ModuleNotFoundError" in engine.stats["errors"][0]
+
+
+def test_bandit_has_py_with_env_in_path(tmp_path):
+    # Directory path contains 'env' as a substring (e.g. env_project or /home/env/)
+    repo_dir = tmp_path / "env_project"
+    repo_dir.mkdir()
+    (repo_dir / "main.py").write_text("print('test')", encoding="utf-8")
+
+    engine = BanditEngine()
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "errors": []}', stderr="")
+        findings = engine.scan(str(repo_dir))
+        assert findings == []
+        mock_run.assert_called_once()
+        args, kwargs = mock_run.call_args
+        assert kwargs["cwd"] == str(repo_dir)
+        assert args[0][-1] == "."
+
+
+def test_bandit_include_suppressed_passes_flag(tmp_path):
+    (tmp_path / "main.py").write_text("print('test')", encoding="utf-8")
+    engine = BanditEngine(include_suppressed=True)
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "errors": []}', stderr="")
+        engine.scan(str(tmp_path))
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "--ignore-nosec" in cmd
+
+
+def test_rel_path_relative_to_root_when_cwd_is_subdirectory(tmp_path, monkeypatch):
+    repo_dir = tmp_path / "repo"
+    sub_dir = repo_dir / "sub"
+    sub_dir.mkdir(parents=True)
+    monkeypatch.chdir(sub_dir)
+
+    # ./x.py should resolve relative to repo_dir root, not the sub_dir cwd
+    assert _rel_path("./x.py", repo_dir) == "x.py"
+    assert _rel_path("models/user.py", repo_dir) == "models/user.py"
+
+
+def test_bandit_relative_config_file_resolved(tmp_path):
+    cfg = tmp_path / "custom_bandit.yaml"
+    cfg.write_text("skips: ['B101']\n", encoding="utf-8")
+    engine = BanditEngine(config_file=str(cfg))
+    assert Path(engine.config_file).is_absolute()
+    assert Path(engine.config_file).exists()
+
+
+def test_bandit_repo_with_python_in_env_dir_not_skipped(tmp_path):
+    repo_dir = tmp_path / "repo"
+    env_dir = repo_dir / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "worker.py").write_text("print('working')", encoding="utf-8")
+
+    engine = BanditEngine()
+    # env/ is not a virtualenv exclude directory; files under env/ must be detected
+    assert engine._has_python_files(repo_dir) is True

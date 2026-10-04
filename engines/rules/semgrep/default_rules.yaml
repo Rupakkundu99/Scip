@@ -5,6 +5,11 @@ rules:
           - pattern: yaml.load($DATA, Loader=yaml.Loader)
           - pattern: yaml.load($DATA, Loader=yaml.CLoader)
           - pattern: yaml.load($DATA, Loader=yaml.UnsafeLoader)
+          - pattern: yaml.load($DATA, Loader=yaml.FullLoader)
+          - pattern: yaml.load($DATA, yaml.Loader)
+          - pattern: yaml.load($DATA, yaml.CLoader)
+          - pattern: yaml.load($DATA, yaml.UnsafeLoader)
+          - pattern: yaml.load($DATA, yaml.FullLoader)
           - pattern: yaml.load($DATA)
     message: "Use of unsafe yaml.load() allows arbitrary object deserialization and code execution. Use yaml.safe_load() instead."
     languages: [python]
@@ -35,7 +40,16 @@ rules:
       - pattern-either:
           - pattern: $CURSOR.execute(f"...", ...)
           - pattern: $CURSOR.execute("..." % (...), ...)
+          - pattern: $CURSOR.execute("..." % $VAR, ...)
           - pattern: $CURSOR.execute("...".format(...), ...)
+          - pattern: $CURSOR.execute($QUERY + $VAR, ...)
+          - pattern: $CURSOR.execute("..." + $VAR, ...)
+          - pattern: $CURSOR.raw(f"...", ...)
+          - pattern: $CURSOR.raw("..." % (...), ...)
+          - pattern: $CURSOR.raw("..." % $VAR, ...)
+          - pattern: $CURSOR.raw("...".format(...), ...)
+          - pattern: $CURSOR.raw($QUERY + $VAR, ...)
+          - pattern: $CURSOR.raw("..." + $VAR, ...)
     message: "SQL query constructed with string formatting or f-strings. Use parameterized queries to prevent SQL injection."
     languages: [python]
     severity: ERROR

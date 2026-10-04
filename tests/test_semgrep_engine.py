@@ -125,6 +125,7 @@ def test_semgrep_empty_target():
 # --------------------------------------------------------------------------- #
 # Integration-level test: custom user rules and default rules
 # --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not SemgrepEngine().is_available(), reason="Semgrep not installed")
 def test_semgrep_user_custom_rules(tmp_path):
     # User provides their own custom ruleset
     custom_rule = tmp_path / "custom_rule.yaml"
@@ -152,3 +153,45 @@ def test_semgrep_user_custom_rules(tmp_path):
     assert f.cwe == "CWE-95"
     assert "eval" in f.title.lower()
     assert f.line == 2
+
+
+def test_semgrep_populates_line_range(tmp_path):
+    engine = SemgrepEngine()
+    canned = {
+        "results": [
+            {
+                "check_id": "scip.test.rule",
+                "path": "app.py",
+                "start": {"line": 10},
+                "end": {"line": 14},
+                "extra": {"message": "Test finding", "severity": "WARNING"},
+            }
+        ],
+        "paths": {"scanned": ["app.py"]},
+        "skipped_rules": [],
+    }
+    findings = engine._parse_output(canned, tmp_path)
+    assert len(findings) == 1
+    assert findings[0].extra["line_range"] == [10, 11, 12, 13, 14]
+
+
+def test_semgrep_non_json_records_error(tmp_path):
+    engine = SemgrepEngine()
+    from unittest.mock import MagicMock
+    mock_proc = MagicMock(returncode=2, stdout="Fatal semgrep error", stderr="")
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run", return_value=mock_proc):
+        findings = engine.scan(str(tmp_path))
+        assert findings == []
+        assert len(engine.stats["errors"]) >= 1
+        assert "no JSON" in engine.stats["errors"][0]
+
+
+def test_semgrep_include_suppressed_passes_flag(tmp_path):
+    from unittest.mock import MagicMock
+    engine = SemgrepEngine(include_suppressed=True)
+    with patch.object(engine, "is_available", return_value=True), patch("subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(returncode=0, stdout='{"results": [], "errors": []}', stderr="")
+        engine.scan(str(tmp_path))
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "--disable-nosem" in cmd

@@ -1,4 +1,6 @@
-"""Unified Finding schema - every engine outputs this."""
+from __future__ import annotations
+
+import copy
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -26,3 +28,7 @@ class Finding:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def clone(self) -> Finding:
+        """Return a deep copy of this finding to prevent accidental in-place mutations."""
+        return copy.deepcopy(self)
