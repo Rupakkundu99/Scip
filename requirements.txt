@@ -8,3 +8,5 @@ fastapi
 uvicorn
 radon
 packaging
+bandit
+semgrep
