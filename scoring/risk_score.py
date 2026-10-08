@@ -23,6 +23,7 @@ Weights are dynamically loaded from .env file or environment variables with defa
 """
 from __future__ import annotations
 
+from dataclasses import asdict, dataclass
 import logging
 import os
 from pathlib import Path
@@ -44,6 +45,52 @@ DEFAULT_WEIGHTS = {
     "WEIGHT_CHURN": 0.05,
     "WEIGHT_HEALTH": 0.05,
 }
+
+
+@dataclass
+class ScoringConfig:
+    """Configurable and bounded tuning knobs for composite risk scoring."""
+    fp_damping_factor: float = 0.20        # Uniform damping for ALL confirmed HIGH false positives (0.05 to 1.0)
+    fp_med_damping: float = 0.60           # Damping for MEDIUM false positives (0.05 to 1.0)
+    secret_repo_reach: float = 0.80        # Exposure reach weight for secrets in working tree (0.0 to 1.0)
+    secret_hist_reach: float = 0.50        # Exposure reach weight for secrets in git history (0.0 to 1.0)
+    worker_reach: float = 0.70             # Exposure reach weight for background worker tasks (0.0 to 1.0)
+    startup_reach: float = 0.40            # Exposure reach weight for startup/lifecycle hooks (0.0 to 1.0)
+    cli_reach: float = 0.30                # Exposure reach weight for CLI tools (0.0 to 1.0)
+    internal_reach: float = 0.20           # Exposure reach weight for internal production code (0.0 to 1.0)
+    unknown_reach: float = 0.50            # Exposure reach weight when reachability is indeterminate (0.0 to 1.0)
+    prng_ref_id_discount: float = 0.50     # Discount for reference/display IDs vs security tokens (0.1 to 1.0)
+    rotated_factor: float = 0.20           # Multiplier for confirmed rotated credentials (0.05 to 1.0)
+    live_verified_factor: float = 1.50     # Multiplier for confirmed live credentials (1.0 to 3.0)
+
+    def __post_init__(self):
+        if not (0.05 <= self.fp_damping_factor <= 1.0):
+            raise ValueError(f"fp_damping_factor must be between 0.05 and 1.0, got {self.fp_damping_factor}")
+        if not (0.05 <= self.fp_med_damping <= 1.0):
+            raise ValueError(f"fp_med_damping must be between 0.05 and 1.0, got {self.fp_med_damping}")
+        if not (0.0 <= self.secret_repo_reach <= 1.0):
+            raise ValueError(f"secret_repo_reach must be between 0.0 and 1.0, got {self.secret_repo_reach}")
+        if not (0.0 <= self.secret_hist_reach <= 1.0):
+            raise ValueError(f"secret_hist_reach must be between 0.0 and 1.0, got {self.secret_hist_reach}")
+        if not (0.0 <= self.worker_reach <= 1.0):
+            raise ValueError(f"worker_reach must be between 0.0 and 1.0, got {self.worker_reach}")
+        if not (0.0 <= self.startup_reach <= 1.0):
+            raise ValueError(f"startup_reach must be between 0.0 and 1.0, got {self.startup_reach}")
+        if not (0.0 <= self.cli_reach <= 1.0):
+            raise ValueError(f"cli_reach must be between 0.0 and 1.0, got {self.cli_reach}")
+        if not (0.0 <= self.internal_reach <= 1.0):
+            raise ValueError(f"internal_reach must be between 0.0 and 1.0, got {self.internal_reach}")
+        if not (0.0 <= self.unknown_reach <= 1.0):
+            raise ValueError(f"unknown_reach must be between 0.0 and 1.0, got {self.unknown_reach}")
+        if not (0.1 <= self.prng_ref_id_discount <= 1.0):
+            raise ValueError(f"prng_ref_id_discount must be between 0.1 and 1.0, got {self.prng_ref_id_discount}")
+        if not (0.05 <= self.rotated_factor <= 1.0):
+            raise ValueError(f"rotated_factor must be between 0.05 and 1.0, got {self.rotated_factor}")
+        if not (1.0 <= self.live_verified_factor <= 3.0):
+            raise ValueError(f"live_verified_factor must be between 1.0 and 3.0, got {self.live_verified_factor}")
+
+
+DEFAULT_SCORING_CONFIG = ScoringConfig()
 
 
 def _normalize_to_repo_rel(file_path: str, repo_path: str) -> str:
@@ -107,10 +154,15 @@ def load_weights(repo_path: Optional[str] = None) -> Dict[str, float]:
     return weights
 
 
-def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]] = None) -> Finding:
+def calculate_finding_risk_score(
+    f: Finding,
+    weights: Optional[Dict[str, float]] = None,
+    config: Optional[ScoringConfig] = None,
+) -> Finding:
     """Calculate normalized 0-100 risk score and explanation string for a finding."""
     if weights is None:
         weights = load_weights()
+    config = config or DEFAULT_SCORING_CONFIG
 
     w_cvss = weights.get("WEIGHT_CVSS", 0.30)
     w_epss = weights.get("WEIGHT_EPSS", 0.20)
@@ -138,14 +190,38 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
     # 3. CISA KEV (1.0 if active, 0.0 otherwise)
     s_kev = 1.0 if bool(extra.get("kev")) else 0.0
 
-    # 4. Reachability (1.0 if reachable, 0.0 if unused, 0.5 if unknown/null)
+    # 4. Reachability & Exposure Tier (Secrets use REPO / HIST exposure model)
     reach = getattr(f, "reachable", None)
-    if reach is True:
+    exposure = getattr(f, "exposure", None) or extra.get("exposure")
+    if exposure == "HTTP":
+        s_reach = 1.0
+    elif exposure == "REPO":
+        s_reach = config.secret_repo_reach
+    elif exposure == "HIST":
+        s_reach = config.secret_hist_reach
+    elif exposure == "WORKER":
+        s_reach = config.worker_reach
+    elif exposure == "STARTUP":
+        s_reach = config.startup_reach
+    elif exposure == "CLI":
+        s_reach = config.cli_reach
+    elif exposure == "INTNL":
+        s_reach = config.internal_reach
+    elif exposure == "TEST":
+        if f.engine == "secrets" or f.cwe in ("CWE-259", "CWE-798"):
+            s_reach = config.secret_repo_reach
+        else:
+            s_reach = 0.0
+    elif exposure in ("DEAD", "NONE"):
+        s_reach = 0.0
+    elif exposure == "UNKNOWN" or reach is None:
+        s_reach = config.unknown_reach
+    elif reach is True:
         s_reach = 1.0
     elif reach is False:
-        s_reach = 0.0
+        s_reach = config.internal_reach if exposure == "INTNL" else 0.0
     else:
-        s_reach = 0.5
+        s_reach = config.unknown_reach
 
     # 5. Blast Radius (0.0 to 1.0, linear saturation capped at 10 callers)
     blast_cnt = int(getattr(f, "blast_radius", 0) or 0)
@@ -177,25 +253,90 @@ def calculate_finding_risk_score(f: Finding, weights: Optional[Dict[str, float]]
 
     risk_score = round(max(0.0, min(100.0, 100.0 * (weighted_sum / total_weight))), 2)
 
+    # 8. PRNG Context Adjustment (Reference ID vs Security Token)
+    ref_id_note = ""
+    if extra.get("is_ref_id"):
+        risk_score = round(risk_score * config.prng_ref_id_discount, 2)
+        ref_id_note = f", PRNG Ref-ID: {config.prng_ref_id_discount:.2f}x"
+
+    # 9. Rotation & Live Verification overrides
+    status_note = ""
+    if extra.get("rotated"):
+        risk_score = round(risk_score * config.rotated_factor, 2)
+        status_note = f", Rotated: {config.rotated_factor:.2f}x"
+    elif extra.get("live_verified"):
+        risk_score = round(min(100.0, risk_score * config.live_verified_factor), 2)
+        status_note = f", Live Verified: {config.live_verified_factor:.2f}x"
+
+    # 10. Graded Seed & Verified False Positive Damping
+    fp_likely = getattr(f, "fp_likelihood", None) or extra.get("fp_likelihood")
+    fp_damped = False
+    damping_factor = 1.0
+    damping_label = "FP Damped"
+
+    seed_class = extra.get("seed_classification")
+    d_mult = extra.get("damping_multiplier")
+
+    if seed_class == "SEED_FULL":
+        damping_factor = config.fp_damping_factor
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped"
+    elif seed_class == "SEED_PARTIAL":
+        damping_factor = config.fp_med_damping
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped"
+    elif d_mult is not None and float(d_mult) < 1.0:
+        damping_factor = float(d_mult)
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "Seed Damped" if seed_class in ("SEED", "SEED_FULL", "SEED_PARTIAL") else "FP Damped"
+    elif fp_likely == "HIGH":
+        damping_factor = config.fp_damping_factor
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "FP Damped"
+    elif fp_likely == "MEDIUM":
+        damping_factor = config.fp_med_damping
+        risk_score = round(risk_score * damping_factor, 2)
+        fp_damped = True
+        damping_label = "FP Damped"
+
+    reach_label = exposure if exposure else ("YES" if reach is True else ("NO" if reach is False else "?"))
+    reach_info = f"Exposure: {reach_label} (s={s_reach:.2f}, w={w_reach:.2f}"
+    if extra.get("attack_path"):
+        reach_info += f", hops={len(extra['attack_path'])}"
+    reach_info += ")"
+
+    fp_note = f", {damping_label}: {damping_factor:.2f}x ({getattr(f, 'fp_reason', '') or extra.get('fp_reason', '')})" if fp_damped else ""
     explanation = (
         f"Risk Score: {risk_score:.2f}/100 | "
         f"CVSS: {f.severity:.1f} (s={s_cvss:.2f}, w={w_cvss:.2f}), "
         f"{exploit_label} (w={w_epss:.2f}), "
         f"KEV: {int(s_kev)} (w={w_kev:.2f}), "
-        f"Reach: {s_reach:.1f} (w={w_reach:.2f}), "
+        f"{reach_info}, "
         f"Blast: {s_blast:.2f} (w={w_blast:.2f}, count={blast_cnt}), "
         f"Churn: {s_churn:.2f} (w={w_churn:.2f}), "
         f"Health: {s_health:.2f} (w={w_health:.2f})"
+        f"{ref_id_note}{status_note}{fp_note}"
     )
 
     f.risk_score = risk_score
     f.explanation = explanation
+    f.extra["scoring_config"] = asdict(config)
     return f
 
 
-def score_and_sort_findings(findings: List[Finding], repo_path: Optional[str] = None) -> List[Finding]:
+def score_and_sort_findings(
+    findings: List[Finding],
+    repo_path: Optional[str] = None,
+    weights: Optional[Dict[str, float]] = None,
+    config: Optional[ScoringConfig] = None,
+) -> List[Finding]:
     """Score all findings and sort in descending order of risk_score (highest risk on top)."""
-    weights = load_weights(repo_path=repo_path)
+    weights = weights or load_weights(repo_path=repo_path)
+    config = config or DEFAULT_SCORING_CONFIG
 
     if repo_path:
         churn_counts = get_git_churn(repo_path)
@@ -216,10 +357,24 @@ def score_and_sort_findings(findings: List[Finding], repo_path: Optional[str] = 
                 if not matched:
                     f.churn = 0.0
 
-        calculate_blast_radius(findings, repo_path)
+        try:
+            from core.risk_graph import RiskGraph
+            risk_graph = RiskGraph(repo_path).build()
+            risk_graph.analyze_reachability(findings)
+        except Exception as e:
+            log.warning("RiskGraph analysis failed, falling back to basic blast radius: %s", e)
+            calculate_blast_radius(findings, repo_path)
+
         calculate_code_health_penalties(findings, repo_path)
 
+        # Detect and tag safe-by-design / protocol-mandated false positives
+        try:
+            from core.fp_detector import detect_false_positives
+            detect_false_positives(findings, repo_path=repo_path)
+        except Exception as e:
+            log.debug("FP detection error: %s", e)
+
     for f in findings:
-        calculate_finding_risk_score(f, weights=weights)
+        calculate_finding_risk_score(f, weights=weights, config=config)
 
     return sorted(findings, key=lambda f: (-f.risk_score, -f.severity, -f.exploitability))

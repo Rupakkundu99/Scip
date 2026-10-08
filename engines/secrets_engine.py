@@ -103,10 +103,24 @@ def shannon_entropy(s: str) -> float:
     return -sum((c / n) * math.log2(c / n) for c in Counter(s).values())
 
 
+_KNOWN_PROVIDER_PREFIXES = (
+    "AKIA", "ASIA", "ABIA", "ACCA",
+    "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "sk_live_", "pk_live_", "sk_test_", "pk_test_",
+    "xoxb-", "xoxp-", "xoxr-", "xoxa-",
+    "sq0atp-", "sq0csp-",
+    "AIza",
+)
+
+
 def mask_secret(s: str) -> str:
-    if len(s) <= 8:
-        return s[:1] + "*" * (len(s) - 1)
-    return f"{s[:4]}**** ({len(s)} chars)"
+    """Mask sensitive secret values without leaking initial characters or exact string length."""
+    if not s:
+        return "********"
+    for prefix in _KNOWN_PROVIDER_PREFIXES:
+        if s.startswith(prefix):
+            return f"{prefix}****"
+    return "********"
 
 
 def fingerprint(s: str) -> str:
@@ -305,6 +319,7 @@ class Match:
     cwe: str
     confidence: str
     variable: Optional[str] = None
+    col_offset: int = 0
 
 
 def _classify_generic(value: str) -> Tuple[str, float, float, float]:
@@ -355,6 +370,8 @@ def _mask_spans(text: str, spans: List[Tuple[int, int, str]]) -> str:
             continue
         out = out[:a] + mask + out[b:]
         last_start = a
+    # Normalize intra-line whitespace padding around values to prevent column alignment length leaks
+    out = re.sub(r"[ \t]{2,}", " ", out)
     return scrub_tokens(out)[:160]
 
 
@@ -410,8 +427,9 @@ def scan_lines(lines: List[Tuple[int, str]], filename: str = "", use_entropy: bo
                         # right shape but not random ('sk_live_abcdefgh...', '..._1234567890'):
                         # almost certainly a documentation / training dummy
                         sev, exp, conf = min(sev, 4.0), min(exp, 0.2), "low"
+                col_offset = span[0] if span else (mt.start(rule.group) if rule.group else 0)
                 add(prio, Match(rule.id, rule.title, fp, masked, "", lineno, shannon_entropy(secret),
-                                sev, exp, rule.cwe, conf), span)
+                                sev, exp, rule.cwe, conf, col_offset=col_offset), span)
 
         # 2) generic assignments ---------------------------------------------
         if len(text) <= _LONG_LINE and any(h in low for h in _GENERIC_HINTS):
@@ -449,8 +467,9 @@ def scan_lines(lines: List[Tuple[int, str]], filename: str = "", use_entropy: bo
                 if is_doc_file(filename):                    # prose / documentation examples
                     conf, sev, exp = "low", min(sev, 4.0), min(exp, 0.2)
                 rid, title, cwe = _generic_title_cwe(key)
+                col_offset = span[0] if span else 0
                 add(100, Match(rid, title, fingerprint(val), mask_secret(val), "", lineno, ent,
-                               sev, exp, cwe, conf, variable=key.split(".")[-1]), span)
+                               sev, exp, cwe, conf, variable=key.split(".")[-1], col_offset=col_offset), span)
 
         # 3) standalone high-entropy strings ---------------------------------
         if (entropy_ok and 34 <= len(text) <= _LONG_LINE
@@ -467,9 +486,10 @@ def scan_lines(lines: List[Tuple[int, str]], filename: str = "", use_entropy: bo
                     continue
                 ent = shannon_entropy(val)
                 if ent >= 4.5:
+                    col_offset = mt.start(1)
                     add(200, Match("high-entropy-string", "High-entropy string (possible secret)",
                                    fingerprint(val), mask_secret(val), "", lineno, ent,
-                                   4.5, 0.3, "CWE-798", "low"), mt.span(1))
+                                   4.5, 0.3, "CWE-798", "low", col_offset=col_offset), mt.span(1))
 
         if found:
             spans = [(sp[0], sp[1], m.masked) for _, m, sp in found.values() if sp]
@@ -662,16 +682,20 @@ class SecretsEngine(Engine):
             truncated_diff_lines=truncated_lines,
         )
 
-    # ---- main entry ------------------------------------------------------ #
     def scan(self, repo_path: str) -> List[Finding]:
         root = Path(repo_path).resolve()
+        self._current_root = root
         self.stats = {"history_scanned": False}
         aggs: Dict[str, _Agg] = {}
         self._scan_tree(root, aggs)
         if self.scan_history:
             self._scan_history(root, aggs)
 
-        findings = [self._make_finding(a) for a in aggs.values()]
+        scope_counts: Dict[Tuple[str, str, str, str], int] = {}
+        findings: List[Finding] = []
+        for a in aggs.values():
+            findings.append(self._make_finding(a, scope_counts=scope_counts))
+
         findings.sort(key=lambda f: (-f.severity, -f.exploitability, f.file, f.line or 0))
         self.stats.update(
             secrets_found=len(findings),
@@ -680,7 +704,12 @@ class SecretsEngine(Engine):
         )
         return findings
 
-    def _make_finding(self, a: _Agg) -> Finding:
+    def _make_finding(
+        self,
+        a: _Agg,
+        occ_idx: Optional[int] = None,
+        scope_counts: Optional[Dict[Tuple[str, str, str, str], int]] = None
+    ) -> Finding:
         m = a.match
         in_tree, in_hist = bool(a.tree), bool(a.history)
         first = a.history[0] if in_hist else None
@@ -709,6 +738,35 @@ class SecretsEngine(Engine):
                     "does not help; purging history (git filter-repo / BFG) is only a partial measure "
                     "once the repository has been cloned or pushed anywhere.")
 
+        scope = "global"
+        full_path = (self._current_root / file) if hasattr(self, "_current_root") and self._current_root else None
+        if full_path and full_path.is_file() and line:
+            try:
+                from engines.blast_radius_engine import find_enclosing_function
+                enc = find_enclosing_function(str(full_path), line)
+                if enc:
+                    scope = enc
+            except Exception:
+                pass
+        if scope == "global" and m.variable:
+            scope = m.variable
+
+        if not hasattr(m, "col_offset"):
+            raise AttributeError(f"Match object missing 'col_offset' attribute: {m}")
+        col = m.col_offset
+        var = m.variable or ""
+
+        if occ_idx is None:
+            if scope_counts is not None:
+                scope_key = (m.rule_id, file, scope, var)
+                occ_idx = scope_counts.get(scope_key, 0)
+                scope_counts[scope_key] = occ_idx + 1
+            else:
+                occ_idx = 0
+
+        # Location fingerprint: rule, file, scope, variable, occ_idx within scope
+        # Line number is deliberately excluded so shifting lines does not change the fingerprint
+        loc_fp = hashlib.sha256(f"{m.rule_id}:{file}:{scope}:{var}:{occ_idx}".encode("utf-8")).hexdigest()[:16]
         return Finding(
             engine=self.name,
             title=title,
@@ -724,10 +782,10 @@ class SecretsEngine(Engine):
                 "rule": m.rule_id,
                 "rule_title": m.title,
                 "confidence": m.confidence,
-                "fingerprint": m.fingerprint,
+                "fingerprint": loc_fp,
+                "col_offset": col,
                 "variable": m.variable,
                 "masked_value": m.masked,
-                "entropy": round(m.entropy, 2),
                 "in_working_tree": in_tree,
                 "in_history": in_hist,
                 "first_seen": first,

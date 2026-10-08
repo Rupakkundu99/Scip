@@ -63,10 +63,11 @@ def test_entropy_values():
 
 
 def test_masking_never_reveals_much():
-    assert mask_secret("abc") == "a**"
+    assert mask_secret("abc") == "********"
+    assert mask_secret("password123") == "********"
     key = fs.aws_access_key_id()               # built at runtime: no AWS-shaped literal in the source
     m = mask_secret(key)
-    assert m.startswith("AKIA****") and "20 chars" in m and key[-4:] not in m
+    assert m == "AKIA****" and key[-4:] not in m
 
 
 def test_fingerprint_is_stable_and_short():
@@ -453,7 +454,7 @@ def test_masking_replaces_only_the_secret_position_not_every_occurrence(tmp_path
     assert f == [] or "postgres://postgres:" in f[0].evidence      # 'postgres' password is a placeholder-ish default
     write(tmp_path, "b.py", 'U = "postgres://alice:Sup3rS3cretPw@db.prod.example.net/app"\n')
     g = [x for x in scan(tmp_path) if x.file == "b.py"][0]
-    assert "alice" in g.evidence and "Sup3rS3cretPw" not in g.evidence and "Sup3****" in g.evidence
+    assert "alice" in g.evidence and "Sup3rS3cretPw" not in g.evidence and "********" in g.evidence
 
 
 # ------------------------------------------------- recall regressions (found on vulpy / pygoat) --
@@ -565,4 +566,37 @@ def test_uuid_not_flagged_as_high_entropy(tmp_path):
     write(tmp_path, "record.py", code)
     found = scan(tmp_path, use_entropy=True)
     assert not any(f.extra.get("rule") == "high-entropy-string" for f in found)
+
+
+def test_secret_fingerprint_stable_across_line_shifts(tmp_path):
+    """Ensure secret structural fingerprint is stable when code above shifts by multiple lines."""
+    code_a = 'db_password = "verySecretPassword123!"\n'
+    write(tmp_path, "db.py", code_a)
+    findings_a = scan(tmp_path)
+    assert len(findings_a) == 1
+    fp_a = findings_a[0].extra["fingerprint"]
+    assert fp_a
+
+    # Add 15 lines of comments above the secret
+    comments = "\n".join(f"# comment line {i}" for i in range(15))
+    code_b = comments + "\n" + code_a
+    write(tmp_path, "db.py", code_b)
+    findings_b = scan(tmp_path)
+    assert len(findings_b) == 1
+    fp_b = findings_b[0].extra["fingerprint"]
+
+    # Fingerprint MUST remain identical despite line shifting
+    assert findings_b[0].line != findings_a[0].line
+    assert fp_a == fp_b
+
+
+def test_match_has_col_offset(tmp_path):
+    """Ensure Match dataclass defines and populates col_offset."""
+    from engines.secrets_engine import scan_lines
+    lines = [(1, 'token = "glpat-abcdef12345678901234"')]
+    matches = scan_lines(lines, "token.py")
+    assert len(matches) >= 1
+    m = matches[0]
+    assert hasattr(m, "col_offset")
+    assert m.col_offset > 0
 

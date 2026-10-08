@@ -4,11 +4,15 @@ import pytest
 from core.finding import Finding
 from scoring.risk_score import (
     DEFAULT_WEIGHTS,
+    DEFAULT_SCORING_CONFIG,
+    ScoringConfig,
     load_weights,
     calculate_finding_risk_score,
     score_and_sort_findings,
     _normalize_to_repo_rel,
 )
+from engines.secrets_engine import mask_secret
+import json
 from engines.churn_engine import get_git_churn
 
 
@@ -214,3 +218,75 @@ def test_score_and_sort_findings_descending():
     assert sorted_res[1].title == "Med"
     assert sorted_res[2].title == "Low"
     assert sorted_res[0].risk_score > sorted_res[1].risk_score > sorted_res[2].risk_score
+
+
+def test_scoring_config_bounds_validation():
+    """ScoringConfig validates that multipliers are strictly bounded in [0.05, 1.0]."""
+    # Valid config initializes fine
+    cfg = ScoringConfig(secret_repo_reach=0.85, secret_hist_reach=0.45)
+    assert cfg.secret_repo_reach == 0.85
+
+    # Out of bounds (> 1.0) must raise ValueError
+    with pytest.raises(ValueError, match="must be between 0.0 and 1.0"):
+        ScoringConfig(secret_repo_reach=1.5)
+
+    # Out of bounds (< 0.05) must raise ValueError
+    with pytest.raises(ValueError, match="must be between 0.05 and 1.0"):
+        ScoringConfig(fp_damping_factor=0.01)
+
+
+def test_serialized_report_contains_no_raw_secrets(tmp_path):
+    """Ensure raw secret values, unsalted hashes, and length hints never leak from real engine scan."""
+    from engines.secrets_engine import SecretsEngine
+    import hashlib
+
+    raw_secret = "ghp_VerySuperSecretToken123456789XYZ"
+    code = f"""def get_client():
+    token = "{raw_secret}"
+    return token
+"""
+    (tmp_path / "auth.py").write_text(code, encoding="utf-8")
+
+    engine = SecretsEngine(scan_history=False)
+    findings = engine.scan(str(tmp_path))
+    assert len(findings) >= 1
+
+    for f in findings:
+        calculate_finding_risk_score(f)
+
+    report_json = json.dumps([f.to_dict() for f in findings])
+
+    # Raw secret must never appear in report
+    assert raw_secret not in report_json
+
+    # Unsalted hash of raw secret must never appear
+    raw_hash = hashlib.sha256(raw_secret.encode()).hexdigest()
+    assert raw_hash not in report_json
+    assert raw_hash[:8] not in report_json
+
+    # No exact length hint or entropy leaking length
+    assert f"length: {len(raw_secret)}" not in report_json
+    assert '"entropy"' not in report_json
+
+    # Masked value format
+    for f in findings:
+        mv = f.extra.get("masked_value", "")
+        assert mv.startswith("ghp_") or mv == "********"
+        assert raw_secret[4:] not in mv
+
+
+def test_committed_secret_in_tests_has_repo_reach():
+    """Secrets committed in tests/ have exposure=TEST but must score reachability using secret_repo_reach, not 0.0."""
+    f = Finding(
+        engine="secrets",
+        title="Live API Key in Tests",
+        file="tests/test_client.py",
+        line=10,
+        cwe="CWE-798",
+        severity=9.0,
+        exposure="TEST",
+    )
+    calculate_finding_risk_score(f)
+    assert "s=0.80" in f.explanation
+    assert f.risk_score > 30.0
+
