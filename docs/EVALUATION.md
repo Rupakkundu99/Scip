@@ -60,6 +60,30 @@ python -m evaluation.run evaluate --scan eval_scans\vulpy_findings.json --labels
 `--strict` makes the command exit with code 1 if any real finding was hidden by the false-positive filter,
 so it can also run in CI. `--line-tolerance 2` lets a label still match after small edits shift lines.
 
+## Large repos: label a random sample
+
+A repo like pygoat produces hundreds of findings, and most are dependency CVEs. You do not need to label them all.
+A random sample gives an honest estimate and is much less work:
+
+    python -m evaluation.run template --scan eval_scans\pygoat_findings.json --labels evaluation\labels\pygoat.yaml --repo-name pygoat --sample 60
+
+* The sample is spread over the engines in proportion to their size and is reproducible (`--seed`).
+* Run it again with `--sample 30` later to add 30 more new findings; existing labels are always kept.
+* Findings that are not in the labels file are simply not part of the evaluation. Never label only the top of
+  the ranking, because that would make the ranking look better than it is.
+* Several people can label different parts: split the file by line range and merge in Git.
+
+## How to label dependency findings (CVEs)
+
+The version number is almost always really vulnerable, so "is the CVE real?" is not the question. Ask instead:
+**is the vulnerable part actually used by this project?**
+
+* `TP`: the app uses the affected library feature, or plausibly could (for example Django's request handling).
+* `FP`: the affected component is not used (for example a GeoDjango CVE when the project has no GIS code).
+* `UNSURE`: you cannot tell from the code.
+
+Every CVE has its own label key (`requirements.txt:11:CWE-400#CVE-2024-1234`), so labelling one never affects another.
+
 ## How to read the results
 
 * **Precision / recall** are only as good as the labels. Report how many findings are labelled

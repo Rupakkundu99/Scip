@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -38,7 +39,38 @@ def _comment(s: str, limit: int = 110) -> str:
     return s if len(s) <= limit else s[: limit - 3] + "..."
 
 
-def build_template(findings: List[Dict[str, Any]], existing_path: Optional[Path], repo_name: str) -> str:
+def pick_sample(seen: Dict[str, Dict[str, Any]], keys: List[str], n: int, seed: int = 0) -> List[str]:
+    """Random sample of n keys, spread over the engines in proportion to their size (at least one each).
+
+    Deterministic for a given scan and seed, so the same sample is chosen if you re-run the command.
+    """
+    if n >= len(keys):
+        return sorted(keys)
+    groups: Dict[str, List[str]] = {}
+    for k in sorted(keys):
+        groups.setdefault(seen[k].get("engine", "?"), []).append(k)
+    total = len(keys)
+    alloc = {e: max(1, round(n * len(g) / total)) for e, g in groups.items()}
+    while sum(alloc.values()) > n:                       # trim the biggest group first
+        e = max((e for e in alloc if alloc[e] > 1), key=lambda e: (alloc[e], e), default=None)
+        if e is None:
+            break
+        alloc[e] -= 1
+    while sum(alloc.values()) < n:                       # top up the biggest group that has spare findings
+        e = max((e for e in alloc if alloc[e] < len(groups[e])), key=lambda e: (len(groups[e]) - alloc[e], e),
+                default=None)
+        if e is None:
+            break
+        alloc[e] += 1
+    rng = random.Random(seed)
+    picked: List[str] = []
+    for e in sorted(groups):
+        picked.extend(rng.sample(groups[e], min(alloc[e], len(groups[e]))))
+    return sorted(picked)
+
+
+def build_template(findings: List[Dict[str, Any]], existing_path: Optional[Path], repo_name: str,
+                   sample: Optional[int] = None, seed: int = 0) -> str:
     """Write the labels file. Keeps every verdict/note already there; adds new findings with empty verdicts.
 
     Only the scanner's masked `evidence` is shown, never raw source, so credentials cannot leak into labels.
@@ -54,6 +86,12 @@ def build_template(findings: List[Dict[str, Any]], existing_path: Optional[Path]
     seen: Dict[str, Dict[str, Any]] = {}
     for f in findings:
         seen.setdefault(finding_key(f), f)
+
+    if sample:
+        # Keep everything already in the file; add a random sample of `sample` of the findings not yet in it.
+        fresh = [k for k in seen if k not in old_findings]
+        chosen = set(pick_sample(seen, fresh, sample, seed))
+        seen = {k: f for k, f in seen.items() if k in old_findings or k in chosen}
 
     lines = [
         f"# SCIP evaluation labels for: {repo_name or '(repo)'}",
@@ -120,6 +158,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     t.add_argument("--scan", required=True, help="JSON written by: python -m core.pipeline <repo> -o scan.json")
     t.add_argument("--labels", required=True, help="labels file to create or update (YAML)")
     t.add_argument("--repo-name", default="", help="name stored in the file, e.g. vulpy")
+    t.add_argument("--sample", type=int, metavar="N",
+                   help="only add a random sample of N new findings (spread over the engines) instead of all; "
+                        "findings left out are simply not part of the evaluation")
+    t.add_argument("--seed", type=int, default=0, help="random seed for --sample (default 0, reproducible)")
 
     e = sub.add_parser("evaluate", help="score a scan against the labels")
     e.add_argument("--scan", required=True)
@@ -138,7 +180,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         findings = _load_scan(args.scan)
         if args.cmd == "template":
             p = Path(args.labels)
-            text = build_template(findings, p, args.repo_name)
+            text = build_template(findings, p, args.repo_name, args.sample, args.seed)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text, encoding="utf-8", newline="\n")
             todo = text.count('verdict: ""')
