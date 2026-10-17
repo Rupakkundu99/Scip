@@ -10,10 +10,12 @@ Label file format (YAML; JSON is also valid YAML):
       - {file: bad/libuser.py, line: 12, tol: 2, cwe: CWE-89, note: "SQL injection in login"}
 
 A finding's key is  "<file>:<line>:<CWE>"  (file relative to the scanned repo, '/' separators,
-line 0 when unknown, CWE '-' when unknown).
+line 0 when unknown, CWE '-' when unknown). Dependency findings add "#<CVE/GHSA id>" so that every
+vulnerability gets its own label, e.g. "requirements.txt:11:CWE-400#CVE-2024-1234".
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -34,14 +36,33 @@ def norm_file(path: Optional[str]) -> str:
     return p
 
 
+_ADVISORY_RE = re.compile(r"\b(CVE-\d{4}-\d+|GHSA(?:-[0-9a-z]{4}){3}|PYSEC-\d{4}-\d+)\b", re.I)
+
+
+def advisory_id(f: Dict[str, Any]) -> str:
+    """Vulnerability id of a dependency finding (CVE / GHSA / PYSEC), or ''."""
+    vid = (f.get("extra") or {}).get("vuln_id")
+    if vid:
+        return str(vid).upper()
+    m = _ADVISORY_RE.search(f.get("title") or "")
+    return m.group(1).upper() if m else ""
+
+
 def finding_key(f: Dict[str, Any]) -> str:
+    """Stable id of a finding: '<file>:<line>:<CWE>' plus '#<advisory id>' for dependency findings.
+
+    Many CVEs can sit on the same requirements.txt line with the same CWE, so without the advisory id
+    they would all share one label.
+    """
     line = f.get("line")
     try:
         line = int(line) if line else 0
     except (TypeError, ValueError):
         line = 0
     cwe = (f.get("cwe") or "-").strip().upper() or "-"
-    return f"{norm_file(f.get('file'))}:{line}:{cwe}"
+    key = f"{norm_file(f.get('file'))}:{line}:{cwe}"
+    vid = advisory_id(f)
+    return f"{key}#{vid}" if vid else key
 
 
 def _split_key(key: str):

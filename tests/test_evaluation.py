@@ -7,7 +7,7 @@ from evaluation.labels import (Expected, LabelError, Labels, finding_key, load_l
                                parse_verdict)
 from evaluation.metrics import evaluate, ranking_metrics
 from evaluation.report import to_console, to_markdown
-from evaluation.run import build_template, main
+from evaluation.run import build_template, main, pick_sample
 
 
 def F(file="a.py", line=1, cwe="CWE-89", engine="bandit", risk=50.0, sev=5.0, fp=None, **kw):
@@ -275,3 +275,76 @@ def test_shipped_vulpy_labels_file_is_valid():
     labels = load_labels(Path(__file__).resolve().parent.parent / "evaluation" / "labels" / "vulpy.yaml")
     assert labels.repo == "vulpy" and labels.expected
     assert any(v["verdict"] == "TP" for v in labels.findings.values())
+
+
+# ------------------------------------------------------------------ dependency keys and sampling
+def test_each_cve_on_the_same_line_gets_its_own_key():
+    a = F("requirements.txt", 11, "CWE-400", engine="dependency", title="CVE-2024-0001: django==4.2 - DoS")
+    b = F("requirements.txt", 11, "CWE-400", engine="dependency", title="CVE-2024-0002: django==4.2 - DoS")
+    assert finding_key(a) == "requirements.txt:11:CWE-400#CVE-2024-0001"
+    assert finding_key(a) != finding_key(b)
+    c = F("requirements.txt", 11, "CWE-400", engine="dependency", title="x", extra={"vuln_id": "ghsa-aaaa-bbbb-cccc"})
+    assert finding_key(c).endswith("#GHSA-AAAA-BBBB-CCCC")        # extra.vuln_id wins, upper-cased
+    d = F("a.py", 3, "CWE-89", title="Bandit B608: Possible SQL injection")
+    assert finding_key(d) == "a.py:3:CWE-89"                        # code findings keep the old key
+
+
+def test_labels_for_one_cve_do_not_leak_to_another():
+    a = F("requirements.txt", 11, "CWE-400", engine="dependency", title="CVE-2024-0001: django==4.2 - x")
+    b = F("requirements.txt", 11, "CWE-400", engine="dependency", title="CVE-2024-0002: django==4.2 - x")
+    labels = L({finding_key(a): "TP", finding_key(b): "FP"})
+    r = evaluate([a, b], labels)
+    assert r["coverage"]["true_positive"] == 1 and r["coverage"]["false_positive"] == 1
+
+
+def _many(n_dep=40, n_code=10):
+    fs = [F("requirements.txt", 11, "CWE-400", engine="dependency", title=f"CVE-2024-{i:04d}: x")
+          for i in range(n_dep)]
+    fs += [F("a.py", i + 1, "CWE-89", engine="bandit") for i in range(n_code)]
+    return fs
+
+
+def test_sample_picks_n_spread_over_engines_and_is_reproducible(tmp_path):
+    fs = _many()
+    t1 = build_template(fs, None, "demo", sample=10, seed=1)
+    p = tmp_path / "l.yaml"
+    p.write_text(t1, encoding="utf-8")
+    data = load_labels(p)
+    assert len(data.findings) == 10
+    engines = [k for k in data.findings if "#CVE" in k]
+    assert 0 < len(engines) < 10                     # both dependency and code findings present
+    assert build_template(fs, None, "demo", sample=10, seed=1) == t1          # same seed -> same sample
+    assert build_template(fs, None, "demo", sample=10, seed=2) != t1          # other seed -> other sample
+
+
+def test_sample_keeps_existing_labels_and_only_adds_new_ones(tmp_path):
+    fs = _many()
+    p = tmp_path / "l.yaml"
+    p.write_text(build_template(fs, None, "demo", sample=6), encoding="utf-8")
+    first = set(load_labels(p).findings)
+    p.write_text(p.read_text(encoding="utf-8").replace(
+        'verdict: ""', 'verdict: "TP"', 1), encoding="utf-8")
+    p.write_text(build_template(fs, p, "", sample=4), encoding="utf-8")
+    second = set(load_labels(p).findings)
+    assert first <= second and len(second) == 10
+
+
+def test_sample_larger_than_available_takes_everything():
+    fs = _many(3, 2)
+    assert build_template(fs, None, "demo", sample=100).count('verdict: ""') == 5
+
+
+def test_findings_left_out_of_the_sample_are_ignored_by_evaluate(tmp_path):
+    fs = _many(30, 10)
+    p = tmp_path / "l.yaml"
+    p.write_text(build_template(fs, None, "demo", sample=8), encoding="utf-8")
+    p.write_text(p.read_text(encoding="utf-8").replace('verdict: ""', 'verdict: "TP"'), encoding="utf-8")
+    r = evaluate(fs, load_labels(p))
+    assert r["coverage"]["labelled"] == 8 and r["coverage"]["unlabelled"] == 32
+
+
+def test_cli_sample_option(tmp_path, capsys):
+    scan, _ = _write(tmp_path, _many(), "")
+    out = tmp_path / "labels.yaml"
+    assert main(["template", "--scan", scan, "--labels", str(out), "--sample", "7", "--seed", "3"]) == 0
+    assert "7 still to label" in capsys.readouterr().out
