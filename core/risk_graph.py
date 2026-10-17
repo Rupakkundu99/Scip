@@ -78,6 +78,7 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
         self.module_node_id = f"module::{self.file_path}"
         self.current_class: Optional[str] = None
         self.current_function: Optional[str] = None
+        self.in_management_command = False
 
         self.local_functions: Set[str] = set()
         self.local_classes: Set[str] = set()
@@ -92,6 +93,13 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 self.local_functions.add(node.name)
             elif isinstance(node, ast.ClassDef):
                 self.local_classes.add(node.name)
+            elif (isinstance(node, ast.Assign) and isinstance(node.value, (ast.List, ast.Tuple))
+                  and any(isinstance(t, ast.Name) and t.id == "__all__" for t in node.targets)):
+                # __all__ = ["hash_password", ...]  -> public API of this module
+                for elt in node.value.elts:
+                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                        self.graph.add_edge(self.module_node_id, f"{self.file_path}::{elt.value}",
+                                            kind="EXPORTS", exported=True, confidence="heuristic")
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     pkg_or_mod = alias.name
@@ -127,6 +135,10 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 for alias in node.names:
                     local_symbol = alias.asname or alias.name
                     self.imported_symbols[local_symbol] = (mod, alias.name)
+                    if self.file_path.endswith("__init__.py") and mod in self.module_to_file:
+                        # `from .auth import hash_password` inside a package __init__ = public re-export
+                        self.graph.add_edge(self.module_node_id, f"{self.module_to_file[mod]}::{alias.name}",
+                                            kind="EXPORTS", exported=True, confidence="heuristic")
                     sub_mod = f"{mod}.{alias.name}" if mod else alias.name
                     self.imported_modules[local_symbol] = sub_mod
                     
@@ -160,7 +172,13 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                 is_test=self.is_test,
             )
 
+        # Django management commands: `class Command(BaseCommand): def handle(...)` is run by `manage.py`
+        prev_cmd = self.in_management_command
+        self.in_management_command = any(
+            str(getattr(b, "id", None) or getattr(b, "attr", None) or "").endswith("BaseCommand") for b in node.bases)
+
         self.generic_visit(node)
+        self.in_management_command = prev_cmd
         self.current_class = prev_class
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
@@ -231,9 +249,15 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
             elif "click.command" in dec_lower or "app.command" in dec_lower:
                 entrypoint_type = "cli"
                 break
-            elif "celery.task" in dec_lower or "shared_task" in dec_lower:
+            elif "celery.task" in dec_lower or "shared_task" in dec_lower or dec_lower.endswith(".task"):
                 entrypoint_type = "worker"
                 break
+            elif dec_lower == "receiver" or dec_lower.endswith(".receiver"):
+                entrypoint_type = "worker"          # Django signal handler: invoked by the framework
+                break
+
+        if not entrypoint_type and self.in_management_command and getattr(node, "name", "") in ("handle", "handle_noargs"):
+            entrypoint_type = "cli"
 
         # Also detect Django function view (def foo(request, ...)) in views.py
         if not entrypoint_type and "views" in self.file_path.lower():
@@ -302,6 +326,32 @@ class RiskGraphASTVisitor(ast.NodeVisitor):
                     if kw_callee:
                         edge_attrs = {"kind": "CALLS", "resolution": res_method, "confidence": "heuristic" if is_h else "exact"}
                         self.graph.add_edge(self.current_function, kw_callee, **edge_attrs)
+        self.generic_visit(node)
+
+    def _add_reference(self, node: ast.AST):
+        """`HANDLERS = {"md5": h_md5}`, `register(callback)`: using a function as a value is evidence
+        that it is used, even though no direct call is visible."""
+        callee_id, is_heuristic, how = self._resolve_callee(node)
+        if not callee_id or callee_id.startswith("pkg::"):
+            return
+        src = self.current_function or self.module_node_id
+        if src == callee_id:
+            return
+        if self.graph.has_edge(src, callee_id):
+            # networkx keeps ONE edge per node pair (e.g. module -CONTAINS-> function): flag it
+            self.graph.edges[src, callee_id]["referenced"] = True
+        else:
+            self.graph.add_edge(src, callee_id, kind="REFERENCES", referenced=True,
+                                resolution=how, confidence="heuristic")
+
+    def visit_Name(self, node: ast.Name):
+        if isinstance(node.ctx, ast.Load):
+            self._add_reference(node)
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node: ast.Attribute):
+        if isinstance(node.ctx, ast.Load):
+            self._add_reference(node)
         self.generic_visit(node)
 
     def visit_Assign(self, node: ast.Assign):
@@ -704,17 +754,29 @@ class RiskGraph:
                 f.extra["entrypoints"] = [self.graph.nodes[ep].get("label", ep) for ep, _ in reachable_paths]
             else:
                 is_ep = any(self.graph.has_edge(ep, target_node) for ep in entrypoints)
+                # Used as a value (dispatch table, callback) or exported from a package = evidence of use
+                has_ref = any(
+                    d.get("kind") in ("REFERENCES", "EXPORTS") or d.get("referenced") or d.get("exported")
+                    for _, _, d in self.graph.in_edges(target_node, data=True))
                 if is_test_path(norm_file):
                     f.reachable = False
                     f.exposure = "TEST"
-                elif len(prod_callers) == 0 and not is_ep:
+                elif not entrypoints:
+                    # No web/CLI/worker entrypoint anywhere: a library, a collection of scripts, or a
+                    # framework we do not model. "Not reachable from an entrypoint" is meaningless here.
+                    f.reachable = None
+                    f.exposure = "UNKNOWN"
+                    f.extra["exposure_detail"] = "no entrypoints detected in this repository"
+                elif len(prod_callers) == 0 and not is_ep and not has_ref:
                     f.reachable = False
                     f.exposure = "DEAD"
                     if f.fp_likelihood is None:
-                        f.fp_likelihood = "HIGH"
-                        f.fp_reason = "Unreachable dead code (zero known callers)"
+                        # MEDIUM, never HIGH: a static call graph cannot see dynamic dispatch, plugins,
+                        # getattr(), entry-point strings or callers outside this repository.
+                        f.fp_likelihood = "MEDIUM"
+                        f.fp_reason = "No callers, references or exports found (static analysis can miss dynamic use)"
                 else:
-                    # Proven analyzed: internal callers exist, but zero entrypoint ingress paths
+                    # Proven analyzed: internal callers/references exist, but zero entrypoint ingress paths
                     f.reachable = False
                     f.exposure = "INTNL"
                     if f.fp_likelihood is None:

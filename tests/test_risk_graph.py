@@ -255,6 +255,9 @@ def internal_child():
 """
         with open(os.path.join(tmpdir, "helper.py"), "w") as f:
             f.write(code)
+        # the repo has an entrypoint (otherwise "no ingress path" is meaningless), it just never uses helper.py
+        with open(os.path.join(tmpdir, "app.py"), "w") as f:
+            f.write("from flask import Flask\napp = Flask(__name__)\n@app.route('/')\ndef index():\n    return 'ok'\n")
 
         rg = RiskGraph(tmpdir).build(force_rebuild=True)
 
