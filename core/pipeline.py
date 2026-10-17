@@ -17,6 +17,7 @@ from typing import List, Optional, Set
 
 from core.dedup import deduplicate_findings
 from core.finding import Finding
+from core.redact import redact_finding
 from core.suppression import filter_suppressions, save_baseline
 from engines.bandit_engine import BanditEngine
 from engines.dependency_engine import DependencyEngine
@@ -138,6 +139,9 @@ def run_scan(
         if test_filtered > 0:
             print(f"[+] Excluded {test_filtered} test fixture finding(s)", file=sys.stderr)
 
+    # Safety net: no engine may ever put a credential value into the report (idempotent).
+    for f in active:
+        redact_finding(f)
     return active
 
 
