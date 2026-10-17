@@ -11,12 +11,13 @@ safe-by-design or protocol-mandated, such as:
 from __future__ import annotations
 
 import ast
+import fnmatch
 import hashlib
 import logging
 import os
 from pathlib import Path
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from core.finding import Finding
 from core.risk_graph import is_test_path
@@ -484,9 +485,22 @@ def _hashed_data_is_sensitive(file_lines: List[str], line_no: Optional[int], evi
     return bool(func is not None and _is_sensitive_identifier(func.name))
 
 
+def _matches_training_path(norm_file: str, training_paths: Sequence[str]) -> bool:
+    """True if the file lies under (or matches) a path the user declared as training material."""
+    path = norm_file.strip("/")
+    for raw in training_paths or ():
+        pat = (raw or "").replace("\\", "/").strip().strip("/")
+        if not pat:
+            continue
+        if path == pat or path.startswith(pat + "/") or fnmatch.fnmatch(path, pat) or fnmatch.fnmatch(path, pat + "/*"):
+            return True
+    return False
+
+
 def _detect_single_finding_fp(
     f: Finding,
-    repo_path: Optional[str]
+    repo_path: Optional[str],
+    training_paths: Sequence[str] = (),
 ) -> None:
     """Evaluate a single finding for false-positive indicators."""
     evidence = f.evidence or ""
@@ -516,24 +530,12 @@ def _detect_single_finding_fp(
     else:
         line_text = evidence
 
-    # 0. Intent/context classifier (training, example, intentionally vulnerable code)
-    is_training_path = False
-    for path_marker in ("dockerized_labs/", "examples/", "docs/", "training/", "tutorial/"):
-        if path_marker in norm_file:
-            is_training_path = True
-            break
-            
-    has_vulnerable_comment = False
-    if file_lines and f.line:
-        s_idx = max(0, f.line - 5)
-        e_idx = min(len(file_lines), f.line + 3)
-        window = "".join(file_lines[s_idx:e_idx])
-        if re.search(r"#\s*vulnerable:?", window, re.IGNORECASE) or re.search(r"intentionally vulnerable", window, re.IGNORECASE):
-            has_vulnerable_comment = True
-            
-    if is_training_path or has_vulnerable_comment:
+    # 0. Intent classifier: code the PERSON RUNNING SCIP declared to be training / example material
+    #    (--training-path). Never inferred from the scanned repo: folder names and comments such as
+    #    "intentionally vulnerable" are attacker-controlled and would let any code opt itself out.
+    if _matches_training_path(norm_file, training_paths):
         f.fp_likelihood = "HIGH"
-        f.fp_reason = "Intent classified as training/example code"
+        f.fp_reason = "Intent classified as training/example code (declared with --training-path)"
         f.extra["damping_multiplier"] = 0.1
         f.extra["fp_likelihood"] = f.fp_likelihood
         f.extra["fp_reason"] = f.fp_reason
@@ -641,11 +643,14 @@ def _clear_fp(f: Finding, why: str) -> None:
     f.extra["fp_blocked"] = f"not demoted: {why}"
 
 
-def detect_false_positives(findings: List[Finding], repo_path: Optional[str] = None) -> List[Finding]:
-    """Inspect findings and tag high-confidence false positive and seed patterns."""
+def detect_false_positives(findings: List[Finding], repo_path: Optional[str] = None,
+                           training_paths: Sequence[str] = ()) -> List[Finding]:
+    """Inspect findings and tag high-confidence false positive and seed patterns.
+
+    ``training_paths``: paths the caller declared as training/example code (see --training-path)."""
     for f in findings:
         try:
-            _detect_single_finding_fp(f, repo_path)
+            _detect_single_finding_fp(f, repo_path, training_paths)
         except Exception as exc:
             loc = f"{getattr(f, 'file', '')}:{getattr(f, 'line', '')}"
             log.warning("False-positive evaluation failed for finding '%s' at %s: %s", getattr(f, "title", "finding"), loc, exc)

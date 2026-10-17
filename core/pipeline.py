@@ -74,6 +74,7 @@ def run_scan(
     scoring: bool = True,
     exclude_tests: bool = False,
     trust_repo_baseline: bool = False,
+    training_paths: Optional[List[str]] = None,
 ) -> List[Finding]:
     engines = engines if engines is not None else get_engines(include_suppressed=include_suppressed)
     findings: List[Finding] = []
@@ -126,7 +127,7 @@ def run_scan(
 
     # 3. Calculate 0-100 risk score and sort by risk_score descending (or legacy sort if disabled)
     if scoring:
-        active = score_and_sort_findings(active, repo_path=repo_path)
+        active = score_and_sort_findings(active, repo_path=repo_path, training_paths=training_paths)
     else:
         active = sorted(active, key=lambda f: (-f.severity, -f.exploitability))
 
@@ -251,6 +252,10 @@ def main(argv=None) -> int:
                     help="custom Semgrep rules file, directory, or preset (e.g., p/python)")
     ap.add_argument("--engines", metavar="LIST",
                     help="comma-separated list of engines to run (e.g. dependency,secrets,bandit,semgrep)")
+    ap.add_argument("--training-path", action="append", default=[], metavar="PATH",
+                    help="declare a folder/glob as training or example code (repeatable), e.g. "
+                         "--training-path dockerized_labs. Findings there are strongly demoted. "
+                         "This is never inferred from the scanned repo.")
     ap.add_argument("--trust-repo-baseline", action="store_true",
                     help="also use a .scip-baseline.json found inside the scanned repo (off by default: "
                          "a scanned repo could use it to hide its own findings)")
@@ -331,6 +336,7 @@ def main(argv=None) -> int:
             scoring=not args.no_scoring,
             exclude_tests=args.exclude_tests,
             trust_repo_baseline=args.trust_repo_baseline,
+            training_paths=args.training_path,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)

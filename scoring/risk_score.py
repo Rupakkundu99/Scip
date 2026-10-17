@@ -369,6 +369,7 @@ def score_and_sort_findings(
     repo_path: Optional[str] = None,
     weights: Optional[Dict[str, float]] = None,
     config: Optional[ScoringConfig] = None,
+    training_paths: Optional[List[str]] = None,
 ) -> List[Finding]:
     """Score all findings and sort in descending order of risk_score (highest risk on top)."""
     weights = weights or load_weights(repo_path=repo_path)
@@ -406,7 +407,7 @@ def score_and_sort_findings(
         # Detect and tag safe-by-design / protocol-mandated false positives
         try:
             from core.fp_detector import detect_false_positives
-            detect_false_positives(findings, repo_path=repo_path)
+            detect_false_positives(findings, repo_path=repo_path, training_paths=training_paths or ())
         except Exception as e:
             log.debug("FP detection error: %s", e)
 

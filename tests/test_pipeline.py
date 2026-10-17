@@ -330,3 +330,22 @@ def vulnerable():
     assert "REACHABLE ATTACK PATHS & REMEDIATION HINTS" in captured.out
     assert "Prod Vulnerability" in captured.out
     assert "Validate input" in captured.out
+
+
+def test_cli_training_path_is_explicit_and_only_then_demotes(tmp_path):
+    import json
+    from core.pipeline import main
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "labs" / "app.py").write_text('DB_PASSWORD = "Tr0ub4dor&3xyz"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+
+    assert main([str(repo), "--engines", "secrets", "--no-history", "--output", str(out)]) == 0
+    plain = json.loads(out.read_text(encoding="utf-8"))
+    assert plain and plain[0].get("fp_likelihood") is None
+
+    assert main([str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs",
+                 "--output", str(out)]) == 0
+    declared = json.loads(out.read_text(encoding="utf-8"))
+    assert declared[0]["fp_likelihood"] == "HIGH"
+    assert declared[0]["risk_score"] < plain[0]["risk_score"]
