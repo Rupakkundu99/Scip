@@ -1,0 +1,32 @@
+# SCIP evaluation labels for: vulpy
+# Set `verdict` to  TP (real vulnerability) | FP (false alarm) | UNSURE  - leave "" to skip.
+# Use `note` to record WHY (this is what you explain in the viva). Re-running `template` keeps your work.
+repo: "vulpy"
+findings:
+  # ===== already labelled =====
+  # [crypto] Cleartext HTTP URL used in network transmission
+  #   evidence: r = requests.post('http://127.0.1.1:5000/api/key', json={'username':username, 'password':password})
+  "bad/api_post.py:16:CWE-319": {verdict: "UNSURE", note: "Password sent over http:// but only to the 127.0.1.1 local dev server. Team to decide."}
+  # [crypto] Cleartext HTTP URL used in network transmission
+  #   evidence: r = requests.post('http://127.0.1.1:5000/api/post', json={'text':message}, headers={'X-APIKEY': a...
+  "bad/api_post.py:30:CWE-319": {verdict: "UNSURE", note: "API key sent over http:// to the 127.0.1.1 local dev server. Team to decide."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: app.config['SECRET_KEY'] = '********'
+  "bad/vulpy-ssl.py:13:CWE-798": {verdict: "TP", note: "SECRET_KEY = 'aaaaaaa': hard-coded and trivially guessable."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: secret = '********'
+  "good/libapi.py:10:CWE-798": {verdict: "TP", note: "API signing secret 'MYSUPERSECRETKEY' hard-coded in source."}
+  # [secrets] Hard-coded secret: High-entropy string (possible secret)
+  #   evidence: key = '********'
+  "good/libsession.py:9:CWE-798": {verdict: "TP", note: "Fernet encryption key hard-coded in source."}
+  # [secrets] Hard-coded secret: Hard-coded secret / API key / token
+  #   evidence: app.config['SECRET_KEY'] = '********'
+  "good/vulpy.py:17:CWE-798": {verdict: "TP", note: "Flask SECRET_KEY hard-coded in source. Still real even in vulpy's 'good' (fixed) version."}
+expected:
+  - {"file": "bad/libuser.py", "line": 12, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: login query built with str.format()"}
+  - {"file": "bad/libuser.py", "line": 25, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: INSERT built with % formatting"}
+  - {"file": "bad/libuser.py", "line": 53, "tol": 2, "cwe": "CWE-89", "note": "SQL injection: UPDATE built with str.format()"}
+  - {"file": "bad/vulpy.py", "line": 55, "tol": 2, "cwe": ["CWE-489", "CWE-94"], "note": "app.run(debug=True) exposes the Werkzeug debugger"}
+  - {"file": "bad/vulpy-ssl.py", "line": 29, "tol": 2, "cwe": ["CWE-489", "CWE-94"], "note": "app.run(debug=True) exposes the Werkzeug debugger"}
+  - {"file": "bad/vulpy-ssl.py", "line": 13, "tol": 2, "cwe": "CWE-798", "note": "hard-coded SECRET_KEY 'aaaaaaa'"}
+  - {"file": "bad/libapi.py", "line": 14, "tol": 2, "cwe": "CWE-330", "note": "API key derived from non-cryptographic random.getrandbits"}
