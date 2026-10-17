@@ -13,6 +13,8 @@
 - [x] Step 8  Scoring + explanations
 - [x] Trust fixes: untrusted-repo config, credential redaction, evidence-based false-positive labels
 - [ ] Step 9  Remediation + verification (rule-based fixes, re-scan + tests before "verified")
+      Slice 1 DONE: dependency upgrades (plan, patch on a copy, re-scan, tests in a fresh venv); see docs/REMEDIATION.md.
+      TODO: secret -> environment variable fixes, code-pattern fixes (weak hash, debug=True), pyproject/lock files.
 - [~] Step 10 CLI done; HTML report / dashboard not started
 - [ ] Step 11 Evaluation (CVSS-only vs risk score, ablation, labelled reachability, comparison with gitleaks/Bandit/osv-scanner)
       Harness DONE: `python -m evaluation.run` (labels, precision, recall, FP-filter safety, ranking vs severity; see docs/EVALUATION.md).
