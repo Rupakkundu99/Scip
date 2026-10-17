@@ -123,11 +123,25 @@ def test_main_ci_mode_ignores_repo_baseline(tmp_path, monkeypatch):
     assert data_ci[0]["title"] == "Test finding"
     assert data_ci[0]["extra"].get("suppressed") is not True
 
-    # In local mode, repo baseline IS auto-loaded, so finding is suppressed and filtered
+    # Local mode no longer auto-loads it either: a baseline inside the scanned repo is
+    # attacker-controlled input and could hide the repo's own findings.
     code_local = main([str(tmp_path), "--output", str(out_file)])
     assert code_local == 0
     data_local = json.loads(out_file.read_text(encoding="utf-8"))
-    assert len(data_local) == 0
+    assert len(data_local) == 1
+
+    # ...unless the person running SCIP explicitly trusts it
+    code_trust = main([str(tmp_path), "--trust-repo-baseline", "--output", str(out_file)])
+    assert code_trust == 0
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 0
+
+    # CI mode never trusts it, even with the flag
+    main([str(tmp_path), "--ci", "--trust-repo-baseline", "--output", str(out_file)])
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 1
+
+    # An explicit --baseline FILE is always honoured
+    main([str(tmp_path), "--baseline", str(repo_base), "--output", str(out_file)])
+    assert len(json.loads(out_file.read_text(encoding="utf-8"))) == 0
 
 
 def test_main_missing_explicit_baseline_exits_2(tmp_path):

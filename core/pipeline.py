@@ -72,6 +72,7 @@ def run_scan(
     is_ci: bool = False,
     scoring: bool = True,
     exclude_tests: bool = False,
+    trust_repo_baseline: bool = False,
 ) -> List[Finding]:
     engines = engines if engines is not None else get_engines(include_suppressed=include_suppressed)
     findings: List[Finding] = []
@@ -89,16 +90,20 @@ def run_scan(
         print(f"[+] Running {engine.name} engine...", file=sys.stderr)
         findings.extend(engine.scan(repo_path))
 
-    # Auto-detect baseline file in repository root if not specified
+    # A baseline stored INSIDE the scanned repository is attacker-controlled input: a repo can ship
+    # a baseline that silently hides its own findings. It is therefore ignored unless the person
+    # running SCIP explicitly trusts it (--trust-repo-baseline) or points to a file (--baseline).
     if not baseline_path:
         default_baseline = Path(repo_path).resolve() / ".scip-baseline.json"
         if default_baseline.exists():
-            if is_ci:
-                print(f"[!] CI mode: skipping auto-detection of {default_baseline}. "
-                      f"Pass --baseline explicitly to enforce a baseline.", file=sys.stderr)
-            else:
+            if trust_repo_baseline and not is_ci:
                 baseline_path = str(default_baseline)
-                print(f"[!] Auto-loading repository baseline: {default_baseline}", file=sys.stderr)
+                print(f"[!] Using repository baseline (trusted by --trust-repo-baseline): {default_baseline}",
+                      file=sys.stderr)
+            else:
+                print(f"[!] Ignoring {default_baseline}: a baseline inside the scanned repo can hide findings. "
+                      f"Pass --baseline FILE to use one, or --trust-repo-baseline if you trust this repo.",
+                      file=sys.stderr)
 
     # 1. Apply inline and baseline suppressions per-source before deduplication
     active, suppressed = filter_suppressions(
@@ -242,6 +247,9 @@ def main(argv=None) -> int:
                     help="custom Semgrep rules file, directory, or preset (e.g., p/python)")
     ap.add_argument("--engines", metavar="LIST",
                     help="comma-separated list of engines to run (e.g. dependency,secrets,bandit,semgrep)")
+    ap.add_argument("--trust-repo-baseline", action="store_true",
+                    help="also use a .scip-baseline.json found inside the scanned repo (off by default: "
+                         "a scanned repo could use it to hide its own findings)")
     ap.add_argument("--ci", action="store_true",
                     help="run in CI mode: require explicit --baseline and do not auto-load repo baseline")
     ap.add_argument("--strict", action="store_true",
@@ -318,6 +326,7 @@ def main(argv=None) -> int:
             is_ci=is_ci,
             scoring=not args.no_scoring,
             exclude_tests=args.exclude_tests,
+            trust_repo_baseline=args.trust_repo_baseline,
         )
     except FileNotFoundError as e:
         print(f"Error: {e}", file=sys.stderr)
