@@ -349,3 +349,60 @@ def test_cli_training_path_is_explicit_and_only_then_demotes(tmp_path):
     declared = json.loads(out.read_text(encoding="utf-8"))
     assert declared[0]["fp_likelihood"] == "HIGH"
     assert declared[0]["risk_score"] < plain[0]["risk_score"]
+
+
+def _two_finding_repo(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "src").mkdir()
+    (repo / "labs" / "demo.py").write_text('DB_PASSWORD = "Tr0ub4dor&3xyz"\n', encoding="utf-8")
+    (repo / "src" / "app.py").write_text('API_PASSWORD = "Zq8x2Lm9Pw4Rt7Yb"\n', encoding="utf-8")
+    return repo
+
+
+def test_json_output_includes_the_score_explanation(tmp_path):
+    import json
+    from core.pipeline import main
+    repo = _two_finding_repo(tmp_path)
+    out = tmp_path / "out.json"
+    main([str(repo), "--engines", "secrets", "--no-history", "--output", str(out)])
+    data = json.loads(out.read_text(encoding="utf-8"))
+    assert data and all(x.get("explanation") for x in data)
+    assert "risk" in data[0]["explanation"].lower() or "score" in data[0]["explanation"].lower()
+
+
+def test_hide_fp_is_opt_in_accounted_for_and_recoverable(tmp_path, capsys):
+    import json
+    from core.pipeline import main
+    repo = _two_finding_repo(tmp_path)
+    out = tmp_path / "out.json"
+    base = [str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs", "--output", str(out)]
+
+    # default: nothing is hidden, the demoted finding is still reported
+    main(base)
+    assert len(json.loads(out.read_text(encoding="utf-8"))) == 2
+
+    # --hide-fp: hidden from the report, but counted, explained, and saved to a sidecar file
+    capsys.readouterr()
+    main(base + ["--hide-fp"])
+    err = capsys.readouterr().err
+    visible = json.loads(out.read_text(encoding="utf-8"))
+    assert [x["file"] for x in visible] == ["src/app.py"]
+    assert "hid 1 likely false positive" in err and "training/example" in err
+    sidecar = tmp_path / "out.hidden-fp.json"
+    hidden = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert [x["file"] for x in hidden] == ["labs/demo.py"]
+
+
+def test_hide_fp_never_hides_protected_findings(tmp_path):
+    """A KEV-listed bug or provider-format token inside a declared training path stays visible."""
+    import json
+    from core.pipeline import main
+    from tests import fake_secrets as fs
+    repo = tmp_path / "repo"
+    (repo / "labs").mkdir(parents=True)
+    (repo / "labs" / "keys.py").write_text(f'GH = "{fs.github_token()}"\n', encoding="utf-8")
+    out = tmp_path / "out.json"
+    main([str(repo), "--engines", "secrets", "--no-history", "--training-path", "labs", "--hide-fp",
+          "--output", str(out)])
+    assert len(json.loads(out.read_text(encoding="utf-8"))) == 1
