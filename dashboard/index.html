@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>SCIP dashboard</title>
-<link href="https://fonts.googleapis.com/css2?family=Jost:wght@200;300;400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Jost:wght@200;300;400;500;700&display=swap" rel="stylesheet">
 <style>
 :root{--bg:#05060a;--p:rgba(255,255,255,.045);--l:rgba(255,255,255,.1);--t:#eceef4;--m:#8b90a0;--o:#ff7a29;--b:#5b86ff;--ok:#3ddc97;--w:#ffb020;--e:#ff5d73;color-scheme:dark;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
 html{scroll-padding-top:env(safe-area-inset-top,0px)}*{box-sizing:border-box}
@@ -14,8 +14,8 @@ nav b{align-self:center;padding:0 12px 0 10px;font-weight:500;letter-spacing:.16
 main{position:relative;z-index:1;max-width:1100px;margin:0 auto;padding:12px 20px 80px}
 h1,h2,h3{font-weight:300;margin:0}
 .hero{min-height:72vh;display:flex;flex-direction:column;justify-content:center;position:relative}
-.hero h1{font-size:clamp(46px,10vw,118px);font-weight:200;line-height:.95;letter-spacing:-.02em}
-.hero em{font-style:normal;margin-left:.7em;opacity:.9}
+.hero h1{font:700 clamp(44px,9vw,108px)/1 Jost,system-ui,sans-serif;letter-spacing:-.02em}
+.hero em{font-style:normal;margin-left:.5em;background:linear-gradient(100deg,var(--o),#ff3d81 45%,var(--b));-webkit-background-clip:text;background-clip:text;color:transparent;filter:drop-shadow(0 0 26px rgba(255,122,41,.35))}
 .sub{max-width:470px;color:var(--m);margin:22px 0}
 .fl{position:absolute;font-size:12px;color:var(--m)}.fl b{display:block;font-size:32px;font-weight:300;color:var(--t)}
 .btn{display:inline-block;border:1px solid var(--l);border-radius:999px;padding:10px 24px;color:var(--t);text-decoration:none;background:rgba(255,255,255,.04);cursor:pointer;font:inherit}
