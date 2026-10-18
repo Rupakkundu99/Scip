@@ -64,6 +64,8 @@ def jump_size(current: str, target: str) -> str:
         c, t = Version(current), Version(target)
     except InvalidVersion:
         return "major"                       # cannot compare: treat as the riskiest
+    if c.major >= 1000 or t.major >= 1000:       # calendar versions (certifi 2022.12.7): no breaking-change meaning
+        return "minor" if (c.major, c.minor) != (t.major, t.minor) else "patch"
     if c.major != t.major:
         return "major"
     if c.minor != t.minor:

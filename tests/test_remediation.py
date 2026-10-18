@@ -40,6 +40,13 @@ def test_major_jump_needs_review_unless_allowed():
     assert plan_upgrades(f, allow_major=True).upgrades[0].risk == "major"
 
 
+def test_calendar_versions_are_not_treated_as_major_jumps():
+    assert jump_size("2022.12.7", "2024.7.4") == "minor"          # certifi
+    assert jump_size("2024.7.4", "2024.7.9") == "patch"
+    p = plan_upgrades([dep("certifi", "2022.12.7", "C1", "2024.7.4")])
+    assert p.upgrades and not p.needs_review
+
+
 def test_jump_size_levels_and_unparseable_is_treated_as_major():
     assert jump_size("1.2.3", "1.2.9") == "patch"
     assert jump_size("1.2.3", "1.5.0") == "minor"
@@ -151,7 +158,9 @@ def _applied(tmp_path):
 
 
 def scan_returning(*ids):
-    return lambda path: [{"engine": "dependency", "extra": {"package": p, "vuln_id": v}} for p, v in ids]
+    """ids are (package, version, vuln_id)."""
+    return lambda path: [{"engine": "dependency", "extra": {"package": p, "version": ver, "vuln_id": v}}
+                         for p, ver, v in ids]
 
 
 BASE = [dep(vid="A"), dep(vid="B")]
@@ -159,15 +168,33 @@ BASE = [dep(vid="A"), dep(vid="B")]
 
 def test_clean_rescan_without_tests_is_scan_only_not_verified(tmp_path):
     v = verify(_applied(tmp_path), BASE, scan_returning())
-    assert v.status == "scan_only" and v.resolved == ["django:A", "django:B"]
+    assert v.status == "scan_only" and v.resolved == ["django==4.2:A", "django==4.2:B"]
     assert any("not proven safe" in m for m in v.messages)
 
 
 def test_remaining_or_introduced_vulnerabilities_need_review(tmp_path):
-    v = verify(_applied(tmp_path), BASE, scan_returning(("django", "B")))
-    assert v.status == "needs_review" and v.remaining == ["django:B"] and v.resolved == ["django:A"]
-    v2 = verify(_applied(tmp_path / "2"), BASE, scan_returning(("django", "NEW")))
-    assert v2.status == "needs_review" and v2.introduced == ["django:NEW"]
+    v = verify(_applied(tmp_path), BASE, scan_returning(("django", "4.2", "B")))
+    assert v.status == "needs_review" and v.remaining == ["django==4.2:B"] and v.resolved == ["django==4.2:A"]
+    v2 = verify(_applied(tmp_path / "2"), BASE, scan_returning(("django", "4.2.16", "NEW")))
+    assert v2.status == "needs_review" and v2.introduced == ["django==4.2.16:NEW"]
+
+
+def test_other_pins_of_the_same_package_are_not_blamed_for_the_upgrade(tmp_path):
+    """Regression: Werkzeug 3.0.1 upgraded, Werkzeug 2.1.2 (major jump) left alone, same CVE ids on both."""
+    repo = _repo(tmp_path, "werkzeug==3.0.1\nwerkzeug==2.1.2\n")
+    ws = make_workspace(repo, tmp_path / "ws")
+    applied = apply_upgrades(ws, [U("werkzeug", "3.0.1", "3.1.9", line=1, fixes=("X", "Y"))])
+    baseline = [dep("werkzeug", "3.0.1", "X", "3.1.9", line=1), dep("werkzeug", "3.0.1", "Y", "3.1.9", line=1),
+                dep("werkzeug", "2.1.2", "X", "3.1.9", line=2), dep("werkzeug", "2.1.2", "Y", "3.1.9", line=2)]
+    after = scan_returning(("werkzeug", "2.1.2", "X"), ("werkzeug", "2.1.2", "Y"))     # untouched pin still reported
+    v = verify(applied, baseline, after)
+    assert v.status == "scan_only" and v.remaining == [] and v.introduced == []
+    assert v.resolved == ["werkzeug==3.0.1:X", "werkzeug==3.0.1:Y"]
+
+
+def test_the_same_pin_in_another_location_is_still_reported_as_remaining(tmp_path):
+    v = verify(_applied(tmp_path), BASE, scan_returning(("django", "4.2", "A")))
+    assert v.remaining == ["django==4.2:A"] and v.status == "needs_review"
 
 
 def test_nothing_applied_status(tmp_path):

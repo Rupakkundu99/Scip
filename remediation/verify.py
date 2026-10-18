@@ -52,18 +52,23 @@ class Verification:
         return asdict(self)
 
 
-def _ident(f: Any) -> Optional[Tuple[str, str]]:
-    """(package, vuln_id) from a Finding object or a dict; None when it is not a dependency finding."""
+def _ident(f: Any) -> Optional[Tuple[str, str, str]]:
+    """(package, version, vuln_id) of a dependency finding (object or dict); None for other findings.
+
+    The VERSION is part of the identity on purpose: the same package can be pinned at several versions in one
+    repo (for example Werkzeug 2.1.2 and 3.0.1). Upgrading one pin must not be blamed for advisories that
+    belong to another pin that was not touched.
+    """
     get = (lambda k, d=None: f.get(k, d)) if isinstance(f, dict) else (lambda k, d=None: getattr(f, k, d))
     if get("engine") != "dependency":
         return None
     ex = get("extra") or {}
     if not ex.get("vuln_id"):
         return None
-    return norm_name(str(ex.get("package", ""))), str(ex["vuln_id"])
+    return norm_name(str(ex.get("package", ""))), str(ex.get("version", "")), str(ex["vuln_id"])
 
 
-def _idset(findings: Iterable[Any]) -> Set[Tuple[str, str]]:
+def _idset(findings: Iterable[Any]) -> Set[Tuple[str, str, str]]:
     return {i for i in (_ident(f) for f in findings) if i}
 
 
@@ -111,13 +116,14 @@ def verify(applied: ApplyResult, baseline: Iterable[Any], scan_fn: ScanFn,
 
     before = _idset(baseline)
     after = _idset(scan_fn(str(applied.workspace)))
-    targeted = {(e.upgrade.package, v) for e in ok for v in e.upgrade.fixes}
-    resolved = sorted(f"{p}:{v}" for p, v in targeted if (p, v) not in after)
-    remaining = sorted(f"{p}:{v}" for p, v in targeted if (p, v) in after)
-    introduced = sorted(f"{p}:{v}" for p, v in after - before)
+    targeted = {(e.upgrade.package, e.upgrade.current, v) for e in ok for v in e.upgrade.fixes}
+    resolved = sorted(f"{p}=={ver}:{v}" for p, ver, v in targeted if (p, ver, v) not in after)
+    remaining = sorted(f"{p}=={ver}:{v}" for p, ver, v in targeted if (p, ver, v) in after)
+    introduced = sorted(f"{p}=={ver}:{v}" for p, ver, v in after - before)
     res = Verification("scan_only", resolved=resolved, remaining=remaining, introduced=introduced)
     if remaining:
-        res.messages.append(f"{len(remaining)} targeted vulnerabilities are still reported after the upgrade.")
+        res.messages.append(f"{len(remaining)} targeted vulnerabilities are still reported after the upgrade "
+                            "(the same package and version is still pinned elsewhere, or the fix did not work).")
     if introduced:
         res.messages.append(f"{len(introduced)} vulnerabilities are new (the upgraded version has its own advisories).")
     if remaining or introduced:
