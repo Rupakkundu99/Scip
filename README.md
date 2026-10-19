@@ -88,7 +88,7 @@ Therefore **nothing inside the scanned repo changes how SCIP behaves**:
 | `core/` | Finding schema, pipeline, risk graph (`risk_graph.py`), false-positive detector, redaction, package aliases |
 | `scoring/` | composite risk score and explanation |
 | `remediation/` | dependency-upgrade remediation: plan, patch on a copy, verify (see `docs/REMEDIATION.md`) |
-| `api/` | not started (see roadmap) |
+| `api/` | dashboard backend: `python -m api` serves `dashboard/` and runs scan, remediation and evaluation as jobs |
 | `evaluation/` | evaluation harness: labels, precision/recall, false-positive filter safety, ranking quality (see `docs/EVALUATION.md`) |
 | `tests/` | pytest suite (CI runs it on every push and PR) |
 | `docs/` | roadmap, contributions |
