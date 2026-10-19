@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
 import shutil
+import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -45,7 +47,7 @@ def make_workspace(repo: Path, dest: Path) -> Path:
         raise ValueError("workspace must be outside the repository")
     if dest.exists():
         shutil.rmtree(dest)
-    shutil.copytree(repo, dest, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
+    shutil.copytree(repo, dest, symlinks=True, ignore=shutil.ignore_patterns(*IGNORE_DIRS))
     return dest
 
 
@@ -80,7 +82,44 @@ def apply_upgrades(workspace: Path, upgrades: List[Upgrade]) -> ApplyResult:
 
     diffs: List[str] = []
     for rel, ups in sorted(by_file.items()):
-        path = ws / rel
+        raw_str = str(rel).strip()
+        if raw_str.startswith(("/", "\\")) or bool(re.match(r"^[A-Za-z]:", raw_str)) or (os.name == "nt" and ":" in raw_str):
+            for up in ups:
+                res.edits.append(EditResult(up, False, f"absolute or drive path rejected: {rel}"))
+            continue
+
+        cleaned_p = Path(raw_str)
+        if any(p == ".." for p in cleaned_p.parts):
+            for up in ups:
+                res.edits.append(EditResult(up, False, f"path traversal rejected: {rel}"))
+            continue
+
+        cur = ws
+        is_symlink = False
+        for part in cleaned_p.parts:
+            cur = cur / part
+            try:
+                st = os.lstat(cur)
+                if stat.S_ISLNK(st.st_mode):
+                    is_symlink = True
+                    break
+            except (FileNotFoundError, OSError):
+                pass
+
+        if is_symlink:
+            for up in ups:
+                res.edits.append(EditResult(up, False, f"symlink rejected: {rel}"))
+            continue
+
+        try:
+            target = cur.resolve()
+            target.relative_to(ws.resolve())
+        except ValueError:
+            for up in ups:
+                res.edits.append(EditResult(up, False, f"path escapes workspace: {rel}"))
+            continue
+
+        path = target
         name = Path(rel).name.lower()
         if not (name.endswith(".txt") and ("require" in name or "dep" in name or "constraint" in name)):
             for up in ups:
