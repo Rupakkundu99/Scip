@@ -332,6 +332,27 @@ def parse_osv_vuln(vuln: dict, package: str) -> Optional[VulnInfo]:
     )
 
 
+def is_dev_requirement_file(rel_path: str) -> bool:
+    norm = (rel_path or "").replace("\\", "/").lower()
+    fn = os.path.basename(norm)
+    if any(k in fn for k in ("-dev", "_dev", ".dev", "dev-", "dev_", "test", "demo", "doc")):
+        return True
+    if any(p in norm for p in ("tests/", "test/", "dockerized_labs/", "docs/", "examples/")):
+        return True
+    return False
+
+
+def _has_python_sources(root: Path) -> bool:
+    try:
+        for p in root.rglob("*.py"):
+            parts = set(p.parts)
+            if not (parts & SKIP_DIRS):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def _combine(items: List[VulnInfo], ids: Set[str]) -> VulnInfo:
     cves = sorted(x for x in ids if x.startswith("CVE-"))
     display = cves[0] if cves else sorted(ids)[0]
@@ -341,11 +362,13 @@ def _combine(items: List[VulnInfo], ids: Set[str]) -> VulnInfo:
         for f in v.fixed:
             if f not in fixed:
                 fixed.append(f)
+    best_summary = max((v.summary for v in items if v.summary), key=len, default="")
+    best_details = max((v.details for v in items if v.details), key=len, default="")
     return VulnInfo(
         id=display,
         aliases=set(ids) - {display},
-        summary=next((v.summary for v in items if v.summary), ""),
-        details=next((v.details for v in items if v.details), ""),
+        summary=best_summary,
+        details=best_details,
         cvss=best.cvss,
         severity_source=best.severity_source,
         cwe=next((v.cwe for v in items if v.cwe), None),
@@ -400,7 +423,7 @@ class DependencyEngine(Engine):
 
     def __init__(self, offline: bool = False, session=None, cache: Optional[Cache] = None,
                  use_epss: bool = True, use_kev: bool = True, max_workers: int = 8,
-                 backoff: float = 0.5):
+                 backoff: float = 0.5, filter_unreachable: bool = True):
         self.offline = offline
         if session is None:
             session = requests.Session()
@@ -411,6 +434,7 @@ class DependencyEngine(Engine):
         self.use_kev = use_kev
         self.max_workers = max_workers
         self.backoff = backoff
+        self.filter_unreachable = filter_unreachable
         self.stats: Dict[str, object] = {}
 
     # ---- HTTP helper ---------------------------------------------------- #
@@ -602,6 +626,20 @@ class DependencyEngine(Engine):
             for v in vulns:
                 findings.append(self._make_finding(name, version, v, locations[(name, version)],
                                                    epss, kev))
+        # Option 1: Early reachability gating
+        # When filter_unreachable is enabled and the target repository contains Python sources,
+        # run AST reachability analysis and FP guards to filter out dead packages, unused
+        # components, and platform-mismatched advisories before returning.
+        if self.filter_unreachable and _has_python_sources(root):
+            from core.risk_graph import RiskGraph
+            from core.fp_detector import detect_false_positives
+            rg = RiskGraph(str(root)).build()
+            rg.analyze_reachability(findings)
+            detect_false_positives(findings, repo_path=str(root))
+            unfiltered_cnt = len(findings)
+            findings = [f for f in findings if getattr(f, "fp_likelihood", None) != "HIGH"]
+            self.stats["unreachable_filtered"] = unfiltered_cnt - len(findings)
+
         findings.sort(key=lambda f: (-f.severity, -f.exploitability, f.file, f.title))
         self.stats.update(
             vulnerable_packages=len(merged),
@@ -634,6 +672,7 @@ class DependencyEngine(Engine):
             desc = (desc + "\n" + v.details)[:700]
 
         first_file, first_line = locs[0]
+        is_dev = all(is_dev_requirement_file(f) for f, l in locs)
         return Finding(
             engine=self.name,
             title=f"{v.id}: {name}=={version} - {v.summary[:100] or 'known vulnerability'}",
@@ -656,6 +695,7 @@ class DependencyEngine(Engine):
                 "epss_percentile": max(pct_vals) if pct_vals else None,
                 "kev": in_kev,
                 "locations": [{"file": f, "line": l} for f, l in locs],
+                "dependency_scope": "dev" if is_dev else "prod",
                 "advisory_url": f"https://osv.dev/vulnerability/{v.id}",
             },
         )
