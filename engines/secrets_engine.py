@@ -106,10 +106,12 @@ def shannon_entropy(s: str) -> float:
 _KNOWN_PROVIDER_PREFIXES = (
     "AKIA", "ASIA", "ABIA", "ACCA",
     "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+    "glpat-", "glcbt-",
     "sk_live_", "pk_live_", "sk_test_", "pk_test_",
     "xoxb-", "xoxp-", "xoxr-", "xoxa-",
     "sq0atp-", "sq0csp-",
-    "AIza",
+    "AIza", "PMAK-",
+    "sk-ant-", "sk-proj-",
 )
 
 
@@ -132,10 +134,18 @@ _PLACEHOLDER_EXACT = {
     "none", "null", "nil", "true", "false", "string", "str", "empty", "undefined",
     "changeme", "change_me", "change-me", "default", "required", "optional",
     "string?", "str?", "int", "integer", "number", "boolean", "bool", "object", "array", "bytes",
+    "test_password", "test_secret", "dummy_secret", "dummy_password", "mock_token", "mock_secret",
+    "fake_key", "fake_secret", "fake_token", "mysecretpassword", "admin123", "secret123",
+    "password123", "123456", "12345678", "letmein", "qwerty",
+    "00000000-0000-0000-0000-000000000000", "0000000000000000",
+    "akiaiosfodnn7example", "wjalrxutnfemi/k7mdeng/bpxrficyexamplekey",
 }
 _PLACEHOLDER_SUBSTR = (
     "example", "your_", "your-", "yourpass", "yoursecret", "yourtoken", "yourkey", "xxxx",
     "placeholder", "dummy", "sample", "insert", "replace", "redacted", "todo", "fixme",
+    "your_api_key", "your_token", "your_secret", "your_password", "your-api-key", "your-token",
+    "insert_here", "insert-here", "dummy_token", "dummy_secret", "test_token", "test_secret",
+    "sample_token", "sample_secret", "fake_token", "fake_secret", "insert_key_here",
     "<", "{{", "${", "%(", "{%", "os.environ", "getenv", "environ[",
 )
 
@@ -151,6 +161,9 @@ def is_placeholder(value: str) -> bool:
     if v[0] in "$%{<[|>!&*":
         return True
     if low in _PLACEHOLDER_EXACT:
+        return True
+    # Known test / mock provider prefixes (e.g. Stripe test keys sk_test_..., pk_test_...)
+    if low.startswith(("sk_test_", "pk_test_")):
         return True
     return any(w in low for w in _PLACEHOLDER_SUBSTR)
 
@@ -189,6 +202,8 @@ PROVIDER_RULES: List[Rule] = [
        ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"), 9.0, 0.9),
     _r("gitlab-token", "GitLab personal access token", r"\b(glpat-[A-Za-z0-9_\-]{20})\b",
        ("glpat-",), 9.0, 0.9),
+    _r("gitlab-ci-token", "GitLab CI job token", r"\b(glcbt-[A-Za-z0-9_\-]{20,})\b",
+       ("glcbt-",), 8.5, 0.8),
     _r("slack-token", "Slack token", r"\b(xox[abprs]-[A-Za-z0-9\-]{10,72})\b",
        ("xox",), 8.5, 0.8),
     _r("slack-webhook", "Slack webhook URL",
@@ -198,6 +213,8 @@ PROVIDER_RULES: List[Rule] = [
        ("_live_",), 9.0, 0.9),
     _r("google-api-key", "Google API key", r"\b(AIza[0-9A-Za-z_\-]{35})\b",
        ("aiza",), 7.5, 0.7),
+    _r("postman-api-key", "Postman API key", r"\b(PMAK-[A-Za-z0-9_\-]{59})\b",
+       ("pmak-",), 8.5, 0.8),
     _r("sendgrid-key", "SendGrid API key", r"\b(SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43})\b",
        ("sg.",), 8.5, 0.8),
     _r("pypi-token", "PyPI upload token", r"\b(pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_\-]{50,})\b",
@@ -207,7 +224,7 @@ PROVIDER_RULES: List[Rule] = [
     _r("anthropic-key", "Anthropic API key", r"\b(sk-ant-[A-Za-z0-9_\-]{20,})\b",
        ("sk-ant-",), 9.0, 0.9),
     _r("openai-key", "OpenAI API key", r"\b(sk-(?:proj-)?[A-Za-z0-9_\-]{40,})\b",
-       ("sk-",), 9.0, 0.9),
+       ("sk-", "sk-proj-"), 9.0, 0.9),
     _r("db-url-password", "Database URL with embedded password",
        r"\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|amqps?|mssql)://[^\s:@/'\"]*:([^\s@/'\"]{3,})@[^\s'\"]+",
        ("://",), 8.0, 0.8),
@@ -249,8 +266,11 @@ _KEY_SUFFIX_IGNORE = {
     "msg", "message", "error", "regex", "pattern", "help", "text", "title", "env", "var", "id", "expiry",
     "expires", "length", "min", "max", "required", "validator", "form", "param", "params", "key_name",
 }
-_ENTROPY_LINE_SKIP = ("sha1", "sha256", "sha384", "sha512", "integrity", "checksum", "digest", "hash",
-                      "md5", "uuid", "data:", "base64,", "font", "csrf", "nonce")
+_ENTROPY_LINE_SKIP = (
+    "sha1", "sha256", "sha384", "sha512", "integrity", "checksum", "digest", "hash",
+    "md5", "uuid", "guid", "data:", "base64,", "font", "csrf", "nonce",
+    "css", "color", "svg", "asset", "icon", "public_key", "pubkey", "cert", "certificate", "style"
+)
 
 
 def looks_like_alphabet(s: str) -> bool:
@@ -590,6 +610,16 @@ class SecretsEngine(Engine):
             self.stats["history_note"] = "not a git repository"
             log.info("%s is not a git repository; skipping history scan", root)
             return
+
+        # Avoid accidental traversal into user's home directory if home dir has .git
+        probe_top = self._git(root, "rev-parse", "--show-toplevel")
+        if probe_top.returncode == 0:
+            top_str = probe_top.stdout.strip().replace("\\", "/").rstrip("/").lower()
+            home_str = str(Path.home().resolve()).replace("\\", "/").rstrip("/").lower()
+            if top_str == home_str and not (root / ".git").exists() and not (root.parent / ".git").exists():
+                self.stats["history_note"] = "not a git repository"
+                log.info("%s parent is user home directory; skipping history scan", root)
+                return
 
         cmd = ["git", "-C", str(root), "-c", "core.quotepath=off", "log", "--all", "--reverse",
                "-p", "-U0", "--relative", "--no-color", "--no-ext-diff", "--no-textconv",
