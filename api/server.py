@@ -142,9 +142,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(409, {"error": "job is not finished"})
                 out: Path = j["out"]
                 if j["kind"] == "remediate":
-                    patch = out.parent / "dependency_upgrades.patch"
+                    def text(name: str) -> str:
+                        f = out.parent / name
+                        return f.read_text(encoding="utf-8") if f.exists() else ""
                     return self._send(200, {"report": json.loads(out.read_text(encoding="utf-8")),
-                                            "patch": patch.read_text(encoding="utf-8") if patch.exists() else ""})
+                                            "patch": text("dependency_upgrades.patch"),
+                                            "code_patch": text("code_fixes.patch")})
                 return self._send(200, body=out.read_bytes())
         self._send(404, {"error": "not found"})
 

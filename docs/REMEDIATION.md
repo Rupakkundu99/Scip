@@ -43,3 +43,22 @@ git apply remediation_out/dependency_upgrades.patch                   # after yo
 * The target version is the highest *fixed* version OSV lists; the new version may have new advisories, which is why the
   re-scan checks for introduced vulnerabilities.
 * Fixes for secrets and code patterns (weak hash, `debug=True`) are not automated yet; see the roadmap.
+
+
+## Code fixes (Bandit)
+
+`python -m remediation.run` also applies Roshan's syntax-aware code patcher (`remediation/code_patcher.py`) to Bandit
+findings that have an automatic fix, on the same copy of the project as the library upgrades. Output: `code_fixes.patch`.
+Use `--no-code` to skip it.
+
+| Tier | Meaning |
+|---|---|
+| `mechanical` | safe by construction (for example `debug=True` to `debug=False`) |
+| `needs_review` | a human must read it (for example the value of an added `timeout=`) |
+
+Findings whose rule has no automatic fix (weak random, MD5, `/tmp` paths and others) are listed as "explained only".
+
+**Re-scan check** (`--verify`): Bandit scans the ORIGINAL and the PATCHED copy with the same settings. Every fixed finding
+must be gone, nothing new may appear, and every patched file must still parse. If Bandit cannot run, the status is
+`scan_unavailable` and the fixes are reported as NOT confirmed. Statuses: `verified` (re-scan clean and tests passed in a
+fresh venv), `scan_only`, `needs_review`, `tests_failed`, `scan_unavailable`, `nothing_applied`.
