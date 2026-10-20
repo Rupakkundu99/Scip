@@ -66,8 +66,10 @@ def default_code_scan(path: str) -> List[Any]:
 @dataclass
 class CodeVerification:
     status: str
-    confirmed: List[str] = field(default_factory=list)
+    confirmed: List[str] = field(default_factory=list)      # one entry per (file, rule), e.g. 'B113 a.py x2'
     remaining: List[str] = field(default_factory=list)
+    confirmed_count: int = 0                                 # number of FINDINGS confirmed gone
+    remaining_count: int = 0
     introduced: List[str] = field(default_factory=list)
     syntax_errors: List[str] = field(default_factory=list)
     tests: TestOutcome = field(default_factory=TestOutcome)
@@ -100,7 +102,12 @@ def verify_code(result: CodePatchResult, original_repo: Path, scan_fn: ScanFn,
     targeted = Counter((_norm(e.file), e.test_id) for e in done)
     for key, n in sorted(targeted.items()):
         label = f"{key[1]} {key[0]}" + (f" x{n}" if n > 1 else "")
-        (v.confirmed if after[key] <= before[key] - n else v.remaining).append(label)
+        if after[key] <= before[key] - n:
+            v.confirmed.append(label)
+            v.confirmed_count += n
+        else:
+            v.remaining.append(label)
+            v.remaining_count += n
     for key in sorted(after):
         if after[key] > before[key]:
             v.introduced.append(f"{key[1]} {key[0]} (+{after[key] - before[key]})")

@@ -144,7 +144,7 @@ def main(argv: Optional[List[str]] = None, scan_fn: Optional[Callable[[str], Any
                 tests = run_tests(final_ws, args.test_cmd, _top_level_requirements(final_ws), args.venv, args.timeout)
             code_ver = verify_code(code_res, repo, code_scan_fn or default_code_scan, tests, args.venv)
             print(f"\nCode verification: {code_ver.status.upper()}")
-            print(f"  confirmed gone: {len(code_ver.confirmed)}   still present: {len(code_ver.remaining)}   "
+            print(f"  confirmed gone: {code_ver.confirmed_count}   still present: {code_ver.remaining_count}   "
                   f"newly introduced: {len(code_ver.introduced)}")
             for m in code_ver.messages:
                 print(f"  - {m}")

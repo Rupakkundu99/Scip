@@ -7,7 +7,7 @@ import pytest
 from remediation.code_fix import (count_by_rule, not_automated, select_code_findings, verify_code)
 from remediation.code_patcher import apply_code_patches
 from remediation.run import main
-from remediation.verify import TestOutcome
+from remediation.verify import TestOutcome as Outcome
 
 APP = 'from flask import Flask\napp = Flask(__name__)\nif __name__ == "__main__":\n    app.run(debug=True)\n'
 
@@ -56,10 +56,23 @@ def test_clean_rescan_confirms_the_fix_but_is_not_called_verified_without_tests(
     assert any("not proven safe" in m for m in v.messages)
 
 
+def test_confirmed_count_counts_findings_not_file_rule_groups(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    (r / "net.py").write_text('import requests\nr1 = requests.get("http://x")\nr2 = requests.get("http://y")\n', encoding="utf-8")
+    res = apply_code_patches(r, [bf("B113", "net.py", 2), bf("B113", "net.py", 3)], tmp_path / "ws")
+
+    def scan(path):
+        lines = (Path(path) / "net.py").read_text(encoding="utf-8").splitlines()
+        return [bf("B113", "net.py", i + 1) for i, l in enumerate(lines) if "requests." in l and "timeout" not in l]
+    v = verify_code(res, r, scan)
+    assert v.confirmed == ["B113 net.py x2"] and v.confirmed_count == 2 and v.remaining_count == 0
+
+
 def test_a_fix_that_does_not_remove_the_finding_needs_review(tmp_path):
     r, res = patched(tmp_path)
     v = verify_code(res, r, lambda p: [bf()])
-    assert v.status == "needs_review" and v.remaining == ["B201 app.py"] and not v.confirmed
+    assert v.status == "needs_review" and v.remaining == ["B201 app.py"] and v.remaining_count == 1 and not v.confirmed
 
 
 def test_a_new_finding_after_the_patch_needs_review(tmp_path):
@@ -98,7 +111,7 @@ def test_nothing_applied_status(tmp_path):
     (True, False, True, "tests_failed"), (False, False, True, "scan_only")])
 def test_tests_decide_between_verified_scan_only_and_tests_failed(tmp_path, ran, passed, fresh, expected):
     r, res = patched(tmp_path)
-    t = TestOutcome(ran=ran, passed=passed, fresh_venv=fresh, command="pytest", error="" if ran else "timeout")
+    t = Outcome(ran=ran, passed=passed, fresh_venv=fresh, command="pytest", error="" if ran else "timeout")
     assert verify_code(res, r, fake_scan, t, fresh).status == expected
 
 
