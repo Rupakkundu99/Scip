@@ -229,3 +229,36 @@ def test_unrelated_call_with_initial_value_ignored(tmp_path):
     found = scan(tmp_path)
     assert not any(f.extra.get("rule") == "static-iv" for f in found)
 
+
+def test_md5_password_context_elevates_cwe_and_severity(tmp_path):
+    code = (
+        "import hashlib\n"
+        "password_hash = hashlib.md5(user_input.encode()).hexdigest()\n"
+        "user_auth = hashlib.sha1(password.encode()).hexdigest()\n"
+    )
+    write_py(tmp_path, "a.py", code)
+    found = scan(tmp_path)
+    assert len(found) == 2
+    for f in found:
+        assert f.cwe == "CWE-916"
+        assert f.severity == 8.5
+        assert f.extra.get("context") == "password"
+        assert "password" in f.title.lower()
+
+
+def test_md5_checksum_context_demotes_severity(tmp_path):
+    code = (
+        "import hashlib\n"
+        "etag = hashlib.md5(response_body).hexdigest()\n"
+        "cache_key = hashlib.sha1(file_content).hexdigest()\n"
+    )
+    write_py(tmp_path, "a.py", code)
+    found = scan(tmp_path)
+    assert len(found) == 2
+    for f in found:
+        assert f.cwe == "CWE-328"
+        assert f.severity == 2.5
+        assert f.extra.get("context") == "checksum"
+        assert "checksum" in f.title.lower()
+
+

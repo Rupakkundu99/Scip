@@ -35,6 +35,54 @@ _SECURITY_NAME_KEYWORDS = (
     "csrf", "nonce", "salt", "api_key", "apikey", "credential"
 )
 
+# Context keywords specifically distinguishing password hashing vs. non-security checksums
+_PASSWORD_HASH_KEYWORDS = (
+    "password", "passwd", "pwd", "passphrase", "credential",
+    "auth_token", "user_secret", "secret_key"
+)
+
+_CHECKSUM_HASH_KEYWORDS = (
+    "etag", "cache", "checksum", "digest", "fingerprint",
+    "content_hash", "file_hash", "chunk_hash", "asset_hash",
+    "cache_key", "bundle_hash", "doc_hash"
+)
+
+
+def _determine_hash_context(assign_targets: List[str], arg_names: List[str]) -> str:
+    """Determine whether hash invocation is used for passwords, checksums, or general purpose."""
+    all_identifiers = [n.lower().replace("-", "_") for n in (assign_targets + arg_names) if n]
+
+    # 1. High-risk password context (CWE-916)
+    for ident in all_identifiers:
+        if any(kw in ident for kw in _PASSWORD_HASH_KEYWORDS):
+            return "password"
+
+    # 2. Low-risk non-security checksum / cache context (CWE-328, lower severity)
+    for ident in all_identifiers:
+        if any(kw in ident for kw in _CHECKSUM_HASH_KEYWORDS):
+            return "checksum"
+
+    return "general"
+
+
+def _extract_arg_identifiers(node: ast.Call) -> List[str]:
+    """Extract variable and attribute names used as inputs to a function call."""
+    names: List[str] = []
+    for arg in node.args:
+        for sub in ast.walk(arg):
+            if isinstance(sub, ast.Name):
+                names.append(sub.id)
+            elif isinstance(sub, ast.Attribute):
+                names.append(sub.attr)
+    for kw in node.keywords:
+        if kw.arg != "usedforsecurity":
+            for sub in ast.walk(kw.value):
+                if isinstance(sub, ast.Name):
+                    names.append(sub.id)
+                elif isinstance(sub, ast.Attribute):
+                    names.append(sub.attr)
+    return names
+
 
 def _is_security_sensitive_name(name: str) -> bool:
     low = name.lower().replace("-", "_")
@@ -69,6 +117,8 @@ class CryptoVisitor(ast.NodeVisitor):
         self.imports: Dict[str, str] = {}
         # variable_name -> literal constant (for scope-local constant tracking)
         self.local_constants: Dict[str, Any] = {}
+        # Track current assignment target variable names for context-aware detection
+        self.current_assign_targets: List[str] = []
 
     def _get_evidence(self, node: ast.AST) -> str:
         lineno = getattr(node, "lineno", 1)
@@ -104,6 +154,15 @@ class CryptoVisitor(ast.NodeVisitor):
             self.imports[asname] = target
         self.generic_visit(node)
 
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        target_name = node.target.id if isinstance(node.target, ast.Name) else None
+        old_targets = self.current_assign_targets
+        self.current_assign_targets = [target_name] if target_name else []
+        try:
+            self.generic_visit(node)
+        finally:
+            self.current_assign_targets = old_targets
+
     def visit_Assign(self, node: ast.Assign) -> None:
         # Track literal assignments for IV / key checking
         val = _get_constant_val(node.value)
@@ -137,7 +196,15 @@ class CryptoVisitor(ast.NodeVisitor):
                             exploitability=0.5,
                             extra={"rule": "insecure-prng", "variable": target.id, "call": call_name},
                         ))
-        self.generic_visit(node)
+
+        old_targets = self.current_assign_targets
+        self.current_assign_targets = [
+            t.id for t in node.targets if isinstance(t, ast.Name)
+        ]
+        try:
+            self.generic_visit(node)
+        finally:
+            self.current_assign_targets = old_targets
 
     def visit_Call(self, node: ast.Call) -> None:
         func_name = self._canonical_name(_get_call_func_name(node.func))
@@ -239,39 +306,71 @@ class CryptoVisitor(ast.NodeVisitor):
                 elif low_name in ("sha1", "sha-1"):
                     is_sha1 = True
 
-        if is_md5:
+        if not (is_md5 or is_sha1):
+            return
+
+        algo = "MD5" if is_md5 else "SHA-1"
+        rule_id = "weak-hash-md5" if is_md5 else "weak-hash-sha1"
+        arg_names = _extract_arg_identifiers(node)
+        context = _determine_hash_context(self.current_assign_targets, arg_names)
+
+        if context == "password":
             self.findings.append(Finding(
                 engine="crypto",
-                title="Use of broken hash algorithm MD5",
+                title=f"Weak hash algorithm {algo} used for password/credential hashing",
+                file=self.file_path,
+                line=node.lineno,
+                cwe="CWE-916",
+                severity=8.5,
+                description=(
+                    f"{algo} is cryptographically broken/weak and must never be used for password or credential hashing. "
+                    "Fast hash functions lack computational work factors and salts, making them vulnerable to "
+                    "high-speed offline dictionary and GPU brute-force attacks."
+                ),
+                evidence=self._get_evidence(node),
+                fix_hint="Migrate to a slow, salted password hashing algorithm such as Argon2id (argon2-cffi), bcrypt, or scrypt (hashlib.scrypt).",
+                exploitability=0.8,
+                extra={"rule": rule_id, "algorithm": algo, "context": "password"},
+            ))
+        elif context == "checksum":
+            self.findings.append(Finding(
+                engine="crypto",
+                title=f"Use of {algo} in non-security checksum / cache key context",
                 file=self.file_path,
                 line=node.lineno,
                 cwe="CWE-328",
-                severity=7.0,
+                severity=2.5,
                 description=(
-                    "MD5 is cryptographically broken and vulnerable to collision and preimage attacks. "
-                    "Do not use it for authentication, signatures, password hashing, or integrity verification."
+                    f"{algo} is used in what appears to be a non-security checksum, cache key, or ETag calculation. "
+                    "While not a direct credential vulnerability, collision vulnerabilities may allow cache poisoning "
+                    "or file collision attacks in untrusted environments."
                 ),
+                evidence=self._get_evidence(node),
+                fix_hint="If used purely for non-security checksums or cache keys, explicitly pass 'usedforsecurity=False' (Python 3.9+) to suppress warnings.",
+                exploitability=0.2,
+                extra={"rule": rule_id, "algorithm": algo, "context": "checksum"},
+            ))
+        else:
+            default_sev = 7.0 if is_md5 else 6.0
+            default_desc = (
+                "MD5 is cryptographically broken and vulnerable to collision and preimage attacks. "
+                "Do not use it for authentication, signatures, password hashing, or integrity verification."
+                if is_md5 else
+                "SHA-1 is deprecated and vulnerable to practical collision attacks (SHAttered). "
+                "It should not be used for security purposes."
+            )
+            self.findings.append(Finding(
+                engine="crypto",
+                title=f"Use of {'broken' if is_md5 else 'weak'} hash algorithm {algo}",
+                file=self.file_path,
+                line=node.lineno,
+                cwe="CWE-328",
+                severity=default_sev,
+                description=default_desc,
                 evidence=self._get_evidence(node),
                 fix_hint="Use SHA-256 (hashlib.sha256) or SHA-3, or pass usedforsecurity=False if computing a non-security checksum.",
-                exploitability=0.6,
-                extra={"rule": "weak-hash-md5", "algorithm": "MD5"},
-            ))
-        elif is_sha1:
-            self.findings.append(Finding(
-                engine="crypto",
-                title="Use of weak hash algorithm SHA-1",
-                file=self.file_path,
-                line=node.lineno,
-                cwe="CWE-328",
-                severity=6.0,
-                description=(
-                    "SHA-1 is deprecated and vulnerable to practical collision attacks (SHAttered). "
-                    "It should not be used for security purposes."
-                ),
-                evidence=self._get_evidence(node),
-                fix_hint="Use SHA-256 (hashlib.sha256), SHA-3, or BLAKE2.",
-                exploitability=0.5,
-                extra={"rule": "weak-hash-sha1", "algorithm": "SHA-1"},
+                exploitability=0.6 if is_md5 else 0.5,
+                extra={"rule": rule_id, "algorithm": algo, "context": "general"},
             ))
 
     def _check_ciphers_and_modes(self, node: ast.Call, func_name: str) -> None:
