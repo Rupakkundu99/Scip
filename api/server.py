@@ -147,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
                         return f.read_text(encoding="utf-8") if f.exists() else ""
                     return self._send(200, {"report": json.loads(out.read_text(encoding="utf-8")),
                                             "patch": text("dependency_upgrades.patch"),
-                                            "code_patch": text("code_fixes.patch")})
+                                            "code_patch": text("code_fixes.display.patch") or text("code_fixes.patch")})
                 return self._send(200, body=out.read_bytes())
         self._send(404, {"error": "not found"})
 

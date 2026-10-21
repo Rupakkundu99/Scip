@@ -15,15 +15,20 @@ Status meanings (same spirit as the library flow, nothing is over-claimed):
 from __future__ import annotations
 
 import ast
+import copy
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from .code_patcher import CodePatchResult, _extract_file, _extract_test_id, can_auto_patch
+from .code_patcher import CodePatchResult, _extract_file
+from .more_fixes import SECRET_ID, patcher_id, select_secret_findings, source_rule
 from .verify import TestOutcome
 
 ScanFn = Callable[[str], Iterable[Any]]
+
+
+ENGINES = ("bandit", "semgrep", "crypto", "secrets")
 
 
 def _engine(f: Any) -> str:
@@ -31,13 +36,51 @@ def _engine(f: Any) -> str:
 
 
 def select_code_findings(findings: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Bandit findings whose rule has an automatic fix (mechanical or needs_review tier)."""
-    return [f for f in findings if _engine(f) == "bandit" and can_auto_patch(f)]
+    """Bandit, Semgrep and crypto findings that have an automatic fix, normalised to the patcher's rule id.
+
+    A copy of each finding gets extra.test_id (the patcher id) plus extra.source_engine / source_rule, so one
+    finding is fixed once even when two engines reported it on the same line.
+    """
+    out, seen = [], set()
+    for f in findings:
+        if _engine(f) not in ("bandit", "semgrep", "crypto"):
+            continue
+        pid = patcher_id(f)
+        if not pid:
+            continue
+        key = (_norm(_extract_file(f)), f.get("line"), pid)
+        if key in seen:
+            continue
+        seen.add(key)
+        eng, rule = source_rule(f)
+        g = copy.deepcopy(f)
+        g["extra"] = dict(g.get("extra") or {}, test_id=pid, source_engine=eng, source_rule=rule)
+        out.append(g)
+    return out
+
+
+def edit_sources(code_findings: Iterable[Dict[str, Any]], secret_findings: Iterable[Dict[str, Any]] = ()) -> Dict:
+    """(file, line, patcher id) -> (engine, rule) of the finding each edit was made for."""
+    m: Dict = {}
+    for f in code_findings:
+        x = f["extra"]
+        m[(_norm(_extract_file(f)), int(f.get("line") or 0), x["test_id"])] = (x["source_engine"], x["source_rule"])
+    for f in secret_findings:
+        m[(_norm(_extract_file(f)), int(f.get("line") or 0), SECRET_ID)] = source_rule(f)
+    return m
 
 
 def not_automated(findings: Iterable[Dict[str, Any]]) -> Dict[str, int]:
-    """Bandit rules we only explain (no automatic fix), with how many findings each has."""
-    c = Counter(_extract_test_id(f) or "UNKNOWN" for f in findings if _engine(f) == "bandit" and not can_auto_patch(f))
+    """Findings (all four code engines) that we only explain, grouped as 'engine rule' with a count."""
+    fixable = {id(f) for f in select_secret_findings(findings)}
+    c: Counter = Counter()
+    for f in findings:
+        eng = _engine(f)
+        if eng not in ENGINES or (eng != "secrets" and patcher_id(f)):
+            continue
+        if eng == "secrets" and id(f) in fixable:
+            continue
+        c[f"{eng} {source_rule(f)[1] or 'unknown'}"] += 1
     return dict(sorted(c.items(), key=lambda kv: -kv[1]))
 
 
@@ -47,20 +90,44 @@ def _norm(path: str) -> str:
 
 
 def count_by_rule(findings: Iterable[Any]) -> Counter:
-    return Counter((_norm(_extract_file(f)), _extract_test_id(f)) for f in findings
-                   if _engine(f) == "bandit" and _extract_test_id(f))
+    """Counts per (engine, file, rule) for the four code engines."""
+    c: Counter = Counter()
+    for f in findings:
+        eng = _engine(f)
+        if eng in ENGINES:
+            rule = source_rule(f)[1]
+            if rule:
+                c[(eng, _norm(_extract_file(f)), rule)] += 1
+    return c
 
 
-def default_code_scan(path: str) -> List[Any]:
-    from engines.bandit_engine import BanditEngine
-    eng = BanditEngine()
-    found = eng.scan(path)
-    st = getattr(eng, "stats", {}) or {}
-    if st.get("skipped"):
-        raise RuntimeError("Bandit is not installed, so the fixes could not be re-scanned")
-    if st.get("parse_error"):
-        raise RuntimeError("Bandit output could not be read")
-    return list(found)
+def default_code_scan(path: str, engines: Iterable[str] = ("bandit",)) -> List[Any]:
+    """Run the named engines on a folder. An engine that cannot run raises, so a fix is never confirmed by silence."""
+    out: List[Any] = []
+    for name in engines:
+        if name == "bandit":
+            from engines.bandit_engine import BanditEngine as E
+            eng = E()
+        elif name == "semgrep":
+            from engines.semgrep_engine import SemgrepEngine as E
+            eng = E()
+        elif name == "crypto":
+            from engines.crypto_engine import CryptoEngine as E
+            eng = E()
+        elif name == "secrets":
+            from engines.secrets_engine import SecretsEngine as E
+            eng = E(scan_history=False)
+        else:
+            continue
+        found = eng.scan(path)
+        st = getattr(eng, "stats", {}) or {}
+        if st.get("skipped"):
+            raise RuntimeError(f"{name} is not available ({st.get('note', 'not installed')}), so the fixes could "
+                               "not be re-scanned")
+        if st.get("parse_error"):
+            raise RuntimeError(f"{name} output could not be read")
+        out.extend(found)
+    return out
 
 
 @dataclass
@@ -80,7 +147,8 @@ class CodeVerification:
 
 
 def verify_code(result: CodePatchResult, original_repo: Path, scan_fn: ScanFn,
-                tests: Optional[TestOutcome] = None, fresh_venv: bool = False) -> CodeVerification:
+                tests: Optional[TestOutcome] = None, fresh_venv: bool = False,
+                sources: Optional[Dict] = None) -> CodeVerification:
     done = result.applied
     if not done:
         return CodeVerification("nothing_applied", messages=["No code edit could be applied; see the skipped list."])
@@ -99,9 +167,13 @@ def verify_code(result: CodePatchResult, original_repo: Path, scan_fn: ScanFn,
         v.messages.append(f"Re-scan not possible: {exc}. The fixes are NOT confirmed.")
         return v
 
-    targeted = Counter((_norm(e.file), e.test_id) for e in done)
+    sources = sources or {}
+    targeted = Counter()
+    for e in done:
+        eng, rule = sources.get((_norm(e.file), e.line, e.test_id), ("bandit", e.test_id))
+        targeted[(eng, _norm(e.file), rule)] += 1
     for key, n in sorted(targeted.items()):
-        label = f"{key[1]} {key[0]}" + (f" x{n}" if n > 1 else "")
+        label = f"{key[0]} {key[2]} {key[1]}" + (f" x{n}" if n > 1 else "")
         if after[key] <= before[key] - n:
             v.confirmed.append(label)
             v.confirmed_count += n
@@ -110,7 +182,7 @@ def verify_code(result: CodePatchResult, original_repo: Path, scan_fn: ScanFn,
             v.remaining_count += n
     for key in sorted(after):
         if after[key] > before[key]:
-            v.introduced.append(f"{key[1]} {key[0]} (+{after[key] - before[key]})")
+            v.introduced.append(f"{key[0]} {key[2]} {key[1]} (+{after[key] - before[key]})")
 
     if v.remaining:
         v.messages.append(f"{len(v.remaining)} fixed finding(s) are still reported after the patch.")
