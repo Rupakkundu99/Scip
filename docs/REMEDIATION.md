@@ -62,3 +62,33 @@ Findings whose rule has no automatic fix (weak random, MD5, `/tmp` paths and oth
 must be gone, nothing new may appear, and every patched file must still parse. If Bandit cannot run, the status is
 `scan_unavailable` and the fixes are reported as NOT confirmed. Statuses: `verified` (re-scan clean and tests passed in a
 fresh venv), `scan_only`, `needs_review`, `tests_failed`, `scan_unavailable`, `nothing_applied`.
+
+
+### Fixes for Semgrep, crypto and secrets findings
+
+| Finding | Fix | Tier |
+|---|---|---|
+| Semgrep `unsafe-load` | `yaml.load` to `yaml.safe_load` (reuses the Bandit B506 patcher) | per patcher |
+| Semgrep `unverified-ssl` | `verify=False` to `verify=True` (B501 patcher) | per patcher |
+| Semgrep `weak-hash`, crypto `weak-hash-md5/sha1` | `hashlib.md5/sha1` to `sha256` (B303 patcher), only for checksum or general use | needs_review |
+| crypto `cleartext-http` | `http://` to `https://` for public hosts; local and private addresses are skipped with a reason | needs_review |
+| secrets (current Python files) | the literal becomes `os.environ["NAME"]`, `import os` is added, names go into `.env.example` | needs_review |
+
+Not auto-fixed (explained only): password hashing with MD5/SHA-1 (SHA-256 is also a fast hash; use Argon2, bcrypt or scrypt),
+Semgrep SQL injection, `shell=True`, `eval`, `tempfile.mktemp`, and secrets that only exist in git history or non-Python files.
+
+**Secrets are handled with extra care.** A patch must contain the old value to be applicable, so it is written only to
+`secret_fixes.patch`, a local file marked as containing secrets. Reports, the dashboard and `code_fixes.display.patch`
+mask every secret value, including a neighbouring secret that appears as patch context. After applying, **rotate the
+secret**: it is still valid and remains in git history.
+
+
+## Pull-request suggestions
+
+The PR bot's one-click suggestions (`core/suggestions.py`) are built from the real file with the same AST patchers, so a suggested
+line is exactly what the verified patch would write (indentation, comments, markers and multi-line calls preserved). They are not
+built from `finding.evidence`: Bandit's evidence is a numbered multi-line snippet that cannot be pasted back into the code.
+
+* Library pins: one suggestion per pinned line, to the lowest version that fixes every CVE on it. Major jumps and secrets get none.
+* A fix that adds a line (for example `timeout=10,` in a multi-line call) is offered as the previous line plus the new line.
+* A suggestion is only offered where the patcher produced a change; GitHub also requires the line to be part of the PR diff.

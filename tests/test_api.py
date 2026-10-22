@@ -29,7 +29,7 @@ def srv(tmp_path, monkeypatch):
     def rem(path, scan, outdir, o, v):
         code = ("import sys,json,pathlib;d=pathlib.Path(sys.argv[1]);d.mkdir(parents=True,exist_ok=True);"
                 "(d/'report.json').write_text(json.dumps({'plan':{},'applied':[]}));"
-                "(d/'dependency_upgrades.patch').write_text('+x');(d/'code_fixes.patch').write_text('+y')")
+                "(d/'dependency_upgrades.patch').write_text('+x');(d/'code_fixes.patch').write_text('+y');(d/'code_fixes.display.patch').write_text('+z')")
         return [sys.executable, "-c", code, str(outdir)]
     monkeypatch.setattr(server, "rem_argv", rem)
     s = server.make_server(0)
@@ -101,7 +101,7 @@ def test_remediation_needs_a_finished_scan_then_returns_report_and_patch(srv):
     rj = jcall(srv.base, "/api/remediate", {"scan_job": sj})[1]["job"]
     assert wait(srv.base, rj)["status"] == "done"
     res = jcall(srv.base, f"/api/jobs/{rj}/result")[1]
-    assert res["patch"] == "+x" and res["code_patch"] == "+y" and "plan" in res["report"]
+    assert res["patch"] == "+x" and res["code_patch"] == "+z" and "plan" in res["report"]
 
 
 def test_evaluation_needs_labels_for_that_project(srv):

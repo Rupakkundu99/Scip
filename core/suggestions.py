@@ -5,10 +5,13 @@ commit remediation in pull request reviews.
 """
 from __future__ import annotations
 
+import ast
+import difflib
 import re
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from core.finding import Finding
 
@@ -41,10 +44,115 @@ def _extract_target_version(fix_hint: str) -> Optional[str]:
     return None
 
 
+# --------------------------------------------------------------------------- verified suggestions
+# Suggestions built from the real file and the same AST patchers that remediation/ uses, so a suggested line is exactly
+# what the verified patch would write (indentation, comments, markers and multi-line calls preserved). Evidence is NOT used:
+# Bandit's evidence is a numbered multi-line snippet, which is not a replaceable source line.
+
+def _as_dict(f: Any) -> Dict[str, Any]:
+    return f if isinstance(f, dict) else f.to_dict()
+
+
+def _read_inside(root: Path, rel: str) -> Optional[str]:
+    base = root.resolve()
+    try:
+        p = (base / rel).resolve()
+        p.relative_to(base)
+        return p.read_bytes().decode("utf-8")
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def _dependency_suggestions(dicts: List[Dict[str, Any]], root: Path) -> List[CodeSuggestion]:
+    from remediation.apply import _edit_line
+    from remediation.plan import plan_upgrades
+    out: List[CodeSuggestion] = []
+    for u in plan_upgrades(dicts).upgrades:                       # major jumps are not suggested for one-click merge
+        text = _read_inside(root, u.file)
+        lines = text.splitlines(keepends=True) if text else []
+        if not 1 <= u.line <= len(lines):
+            continue
+        new, _ = _edit_line(lines[u.line - 1], u)
+        if new is None:
+            continue
+        out.append(CodeSuggestion(
+            file=u.file.replace("\\", "/"), line=u.line, end_line=u.line, replacement=new.rstrip("\r\n"),
+            explanation=f"Upgrade `{u.package}` {u.current} to `{u.target}`: fixes {len(u.fixes)} known "
+                        f"vulnerabilit{'y' if len(u.fixes) == 1 else 'ies'} ({u.risk} update). Run your tests after merging."))
+    return out
+
+
+def _code_suggestions(dicts: List[Dict[str, Any]], root: Path) -> List[CodeSuggestion]:
+    from remediation.code_fix import select_code_findings
+    from remediation.code_patcher import RULE_PATCHERS, patch_file_content
+    by_file: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for f in select_code_findings(dicts):
+        by_file[str(f["file"]).replace("\\", "/")].append(f)
+    out: List[CodeSuggestion] = []
+    for rel, fs in sorted(by_file.items()):
+        text = _read_inside(root, rel)
+        if text is None:
+            continue
+        new, records = patch_file_content(text, fs, rel)
+        if new == text:
+            continue
+        a, b = text.splitlines(keepends=True), new.splitlines(keepends=True)
+        for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
+            if tag == "insert" and i1 >= 1:                           # a suggestion can only replace lines:
+                i1, i2, j1 = i1 - 1, i1, j1 - 1                         # replace the previous line by itself + the new ones
+            elif tag != "replace":
+                continue
+            recs = [r for r in records if r.applied and i1 + 1 <= r.line <= i2 + (1 if tag == "insert" else 0)] or \
+                [r for r in records if r.applied]
+            desc = " ".join(dict.fromkeys(RULE_PATCHERS[r.test_id].description for r in recs if r.test_id in RULE_PATCHERS))
+            note = " ".join(dict.fromkeys(r.review_note for r in recs if r.tier == "needs_review" and r.review_note))
+            out.append(CodeSuggestion(
+                file=rel, line=i1 + 1, end_line=i2,
+                replacement="".join(b[j1:j2]).rstrip("\r\n").replace("\r\n", "\n"),
+                explanation=(desc or "Apply the recommended security fix.") + (f" **Review before accepting:** {note}" if note else "")))
+    return out
+
+
+def generate_suggestions(findings: Iterable[Any], repo_path: Any) -> List[CodeSuggestion]:
+    """Verified one-click suggestions for dependency pins and for Bandit/Semgrep/crypto findings with an AST fix.
+
+    One suggestion per pinned line (the lowest version that fixes every CVE on it) and one per changed line range.
+    Secrets are never suggested: a suggestion would have to contain the value, and the change needs `import os` and
+    a rotation of the secret, which a single line cannot express.
+    """
+    root = Path(repo_path)
+    dicts = [_as_dict(f) for f in findings]
+    return _dependency_suggestions(dicts, root) + _code_suggestions(dicts, root)
+
+
+def _looks_like_source_line(evidence: str) -> bool:
+    """True only for one clean line of Python. Bandit's numbered snippets ('28 29 app.run(...)') are rejected."""
+    ev = (evidence or "").strip()
+    if not ev or "\n" in ev or ev.endswith("..."):
+        return False
+    try:
+        ast.parse(ev)
+    except SyntaxError:
+        return False
+    return True
+
+
 def generate_code_suggestion(finding: Finding, repo_path: Optional[str] = None) -> Optional[CodeSuggestion]:
-    """Generate a high-confidence CodeSuggestion for a finding if an exact fix can be formulated."""
+    """Generate a high-confidence CodeSuggestion for a finding if an exact fix can be formulated.
+
+    With a repo_path the verified AST patchers are used. Without one, only a clean one-line evidence can be edited.
+    """
     if not finding.line or finding.line < 1:
         return None
+    if repo_path:
+        for s in generate_suggestions([finding], repo_path):
+            if s.line <= finding.line <= (s.end_line or s.line):
+                return s
+    if finding.engine == "bandit" and not _looks_like_source_line(finding.evidence):
+        return finding.extra.get("suggested_fix") and CodeSuggestion(
+            file=finding.file.replace("\\", "/"), line=finding.line,
+            end_line=finding.extra.get("end_line", finding.line), replacement=str(finding.extra["suggested_fix"]),
+            explanation=finding.fix_hint or "Apply recommended security remediation.") or None
 
     # 1. Dependency Engine: Requirements upgrade suggestions
     if finding.engine == "dependency" and finding.file.endswith(("requirements.txt", "requirements.in", ".txt")):

@@ -41,18 +41,18 @@ def test_only_fixable_bandit_findings_are_selected_and_the_rest_are_counted():
     fs = [bf("B201"), bf("B113", line=9), bf("B311", line=2), bf("B311", line=3),
           {"engine": "semgrep", "file": "a.py", "line": 1, "extra": {"test_id": "B201"}}]
     assert [f["extra"]["test_id"] for f in select_code_findings(fs)] == ["B201", "B113"]
-    assert not_automated(fs) == {"B311": 2}
+    assert not_automated(fs)["bandit B311"] == 2
 
 
 def test_count_by_rule_normalises_paths():
-    assert count_by_rule([bf(file="./app.py"), bf(file="app.py")])[("app.py", "B201")] == 2
+    assert count_by_rule([bf(file="./app.py"), bf(file="app.py")])[("bandit", "app.py", "B201")] == 2
 
 
 # ------------------------------------------------------------------ verification
 def test_clean_rescan_confirms_the_fix_but_is_not_called_verified_without_tests(tmp_path):
     r, res = patched(tmp_path)
     v = verify_code(res, r, fake_scan)
-    assert v.status == "scan_only" and v.confirmed == ["B201 app.py"] and not v.remaining and not v.introduced
+    assert v.status == "scan_only" and v.confirmed == ["bandit B201 app.py"] and not v.remaining and not v.introduced
     assert any("not proven safe" in m for m in v.messages)
 
 
@@ -66,13 +66,13 @@ def test_confirmed_count_counts_findings_not_file_rule_groups(tmp_path):
         lines = (Path(path) / "net.py").read_text(encoding="utf-8").splitlines()
         return [bf("B113", "net.py", i + 1) for i, l in enumerate(lines) if "requests." in l and "timeout" not in l]
     v = verify_code(res, r, scan)
-    assert v.confirmed == ["B113 net.py x2"] and v.confirmed_count == 2 and v.remaining_count == 0
+    assert v.confirmed == ["bandit B113 net.py x2"] and v.confirmed_count == 2 and v.remaining_count == 0
 
 
 def test_a_fix_that_does_not_remove_the_finding_needs_review(tmp_path):
     r, res = patched(tmp_path)
     v = verify_code(res, r, lambda p: [bf()])
-    assert v.status == "needs_review" and v.remaining == ["B201 app.py"] and v.remaining_count == 1 and not v.confirmed
+    assert v.status == "needs_review" and v.remaining == ["bandit B201 app.py"] and v.remaining_count == 1 and not v.confirmed
 
 
 def test_a_new_finding_after_the_patch_needs_review(tmp_path):
@@ -81,7 +81,7 @@ def test_a_new_finding_after_the_patch_needs_review(tmp_path):
     def scan(path):
         return fake_scan(path) + ([bf("B113", line=9)] if "ws" in str(path) else [])
     v = verify_code(res, r, scan)
-    assert v.status == "needs_review" and v.introduced == ["B113 app.py (+1)"]
+    assert v.status == "needs_review" and v.introduced == ["bandit B113 app.py (+1)"]
 
 
 def test_unavailable_scanner_never_confirms_a_fix(tmp_path):
@@ -143,7 +143,7 @@ def test_cli_applies_library_and_code_fixes_together_without_touching_the_origin
     assert "debug=False" in (final / "app.py").read_text(encoding="utf-8")
     c = rep["code"]
     assert c["applied"][0]["test_id"] == "B201" and c["applied"][0]["tier"] == "mechanical"
-    assert c["not_automated"] == {"B311": 1} and c["verification"]["status"] == "scan_only"
+    assert c["not_automated"] == {"bandit B311": 1} and c["verification"]["status"] == "scan_only"
     assert rep["verification"]["status"] == "scan_only"
 
 
@@ -154,7 +154,7 @@ def test_cli_code_only_project_needs_no_network_and_no_library_scan(tmp_path):
         raise AssertionError("library re-scan must not run when no library was upgraded")
     code, out, rep = run_cli(tmp_path, [bf()], ["--verify"], r, scan_fn=must_not_run, code_scan_fn=fake_scan)
     assert code == 0 and rep["verification"]["status"] == "nothing_applied"
-    assert rep["code"]["verification"]["confirmed"] == ["B201 app.py"] and not (out / "dependency_upgrades.patch").exists()
+    assert rep["code"]["verification"]["confirmed"] == ["bandit B201 app.py"] and not (out / "dependency_upgrades.patch").exists()
 
 
 def test_cli_plan_only_writes_code_patch_without_verifying(tmp_path):

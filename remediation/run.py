@@ -17,8 +17,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from .apply import apply_upgrades, make_workspace
-from .code_fix import (CodeVerification, default_code_scan, not_automated, select_code_findings, verify_code)
+from .code_fix import (CodeVerification, _norm, default_code_scan, edit_sources, not_automated, select_code_findings,
+                       verify_code)
 from .code_patcher import CodePatchResult, apply_code_patches
+from .more_fixes import SECRET_ID, apply_secret_fixes, collect_secret_values, redact, select_secret_findings
 from .plan import Plan, plan_upgrades
 from .verify import default_scan, run_tests, verify
 
@@ -46,12 +48,27 @@ def build_report(plan: Plan, applied, verification, code: Optional[Dict[str, Any
 
 
 def build_code_report(res: Optional[CodePatchResult], ver: Optional[CodeVerification],
-                      findings: List[Dict[str, Any]]) -> Dict[str, Any]:
-    edits = [e.to_dict() for e in res.edits] if res else []
+                      findings: List[Dict[str, Any]], sources: Optional[Dict] = None,
+                      secret_values: Optional[List[str]] = None) -> Dict[str, Any]:
+    sources = sources or {}
+    edits = []
+    for e in (res.edits if res else []):
+        d = e.to_dict()
+        for k in ("original", "patched", "reason", "review_note"):
+            d[k] = redact(d.get(k) or "", secret_values or [])
+        eng, rule = sources.get((_norm(e.file), e.line, e.test_id), ("bandit", e.test_id))
+        d.update(source_engine=eng, source_rule=rule)
+        edits.append(d)
+    warnings = []
+    if any(e["applied"] and e["test_id"] == SECRET_ID for e in edits):
+        warnings.append("Rotate every secret that was moved to an environment variable: the old value is still valid and "
+                        "stays in the git history. Secret values are never written to this report; the exact patch is "
+                        "in secret_fixes.patch (a local file that contains them).")
     return {
         "applied": [e for e in edits if e["applied"]],
         "skipped": [e for e in edits if not e["applied"]],
         "not_automated": not_automated(findings),
+        "warnings": warnings,
         "verification": ver.to_dict() if ver else None,
     }
 
@@ -110,22 +127,50 @@ def main(argv: Optional[List[str]] = None, scan_fn: Optional[Callable[[str], Any
         print(f"\n[+] Library patch written to {out / 'dependency_upgrades.patch'}")
 
     code_res: Optional[CodePatchResult] = None
+    combined: Optional[CodePatchResult] = None
+    sources: Dict = {}
+    secret_vals: List[str] = []
+    final_ws = ws
     if not args.no_code:
         todo = select_code_findings(findings)
+        secrets_todo = select_secret_findings(findings)
+        secret_vals = collect_secret_values(repo, findings)
+        sources = edit_sources(todo, secrets_todo)
         manual = not_automated(findings)
-        print(f"\nCode fixes (Bandit): {len(todo)} finding(s) have an automatic fix; "
-              f"{sum(manual.values())} are explained only")
+        print(f"\nCode fixes: {len(todo)} finding(s) from Bandit, Semgrep and crypto and {len(secrets_todo)} hard-coded "
+              f"secret(s) have an automatic fix; {sum(manual.values())} are explained only")
         if todo:
             code_res = apply_code_patches(ws, todo, out / "workspace_final")
+            final_ws = code_res.workspace
             for e in code_res.edits:
-                print(f"  {e.test_id:<5} {e.tier:<12} {e.file}:{e.line:<5} "
+                eng, rule = sources.get((_norm(e.file), e.line, e.test_id), ("bandit", e.test_id))
+                print(f"  {eng + ' ' + rule:<26} {e.tier:<12} {e.file}:{e.line:<5} "
                       f"{'applied' if e.applied else 'skipped: ' + (e.reason or e.status)}")
             if code_res.diff:
                 (out / "code_fixes.patch").write_text(code_res.diff, encoding="utf-8", newline="\n")
+                shown = redact(code_res.diff, secret_vals)
+                if shown != code_res.diff:        # a neighbouring secret sits in the patch context: keep a masked copy
+                    (out / "code_fixes.display.patch").write_text(shown, encoding="utf-8", newline="\n")
                 print(f"[+] Code patch written to {out / 'code_fixes.patch'}  "
-                      f"({len(code_res.applied)} edit(s); 'needs_review' fixes need a human look)")
+                      f"('needs_review' fixes need a human look)")
+        secret_res = None
+        if secrets_todo:
+            if code_res is None:
+                final_ws = make_workspace(ws, out / "workspace_final")
+            secret_res = apply_secret_fixes(final_ws, secrets_todo)
+            for e in secret_res.edits:
+                print(f"  {'secrets hard-coded':<26} {e.tier:<12} {e.file}:{e.line:<5} "
+                      f"{'applied' if e.applied else 'skipped: ' + (e.reason or e.status)}")
+            if secret_res.diff:
+                (out / "secret_fixes.patch").write_text(
+                    "# CONTAINS SECRET VALUES. Keep this file local; never commit or share it.\n" + secret_res.diff,
+                    encoding="utf-8", newline="\n")
+                print(f"[+] Secret patch written to {out / 'secret_fixes.patch'} (contains the old values: keep it local)")
+                print("[!] ROTATE these secrets: they stay valid and remain in the git history.")
+        edits_all = (code_res.edits if code_res else []) + (secret_res.edits if secret_res else [])
+        if edits_all:
+            combined = CodePatchResult(workspace=final_ws, diff=code_res.diff if code_res else "", edits=edits_all)
 
-    final_ws = code_res.workspace if code_res else ws
     applied.workspace = final_ws          # re-scan and tests must see the library AND the code fixes together
 
     verification = code_ver = None
@@ -138,18 +183,21 @@ def main(argv: Optional[List[str]] = None, scan_fn: Optional[Callable[[str], Any
               f"newly introduced: {len(v.introduced)}")
         for m in v.messages:
             print(f"  - {m}")
-        if code_res and code_res.applied:
+        if combined and combined.applied:
             tests = v.tests if (applied.applied and v.tests.command) else None
             if tests is None and args.test_cmd:
                 tests = run_tests(final_ws, args.test_cmd, _top_level_requirements(final_ws), args.venv, args.timeout)
-            code_ver = verify_code(code_res, repo, code_scan_fn or default_code_scan, tests, args.venv)
+            needed = sorted({sources.get((_norm(e.file), e.line, e.test_id), ("bandit",))[0] for e in combined.applied})
+            scan = code_scan_fn or (lambda p: default_code_scan(p, engines=needed))
+            code_ver = verify_code(combined, repo, scan, tests, args.venv, sources)
             print(f"\nCode verification: {code_ver.status.upper()}")
             print(f"  confirmed gone: {code_ver.confirmed_count}   still present: {code_ver.remaining_count}   "
                   f"newly introduced: {len(code_ver.introduced)}")
             for m in code_ver.messages:
                 print(f"  - {m}")
 
-    code_report = build_code_report(code_res, code_ver, findings) if not args.no_code else None
+    code_report = (build_code_report(combined, code_ver, findings, sources, secret_vals)
+                   if not args.no_code else None)
     (out / "report.json").write_text(json.dumps(build_report(plan, applied, verification, code_report), indent=2),
                                      encoding="utf-8", newline="\n")
     print(f"[+] Report written to {out / 'report.json'}")
