@@ -81,3 +81,14 @@ Semgrep SQL injection, `shell=True`, `eval`, `tempfile.mktemp`, and secrets that
 `secret_fixes.patch`, a local file marked as containing secrets. Reports, the dashboard and `code_fixes.display.patch`
 mask every secret value, including a neighbouring secret that appears as patch context. After applying, **rotate the
 secret**: it is still valid and remains in git history.
+
+
+## Pull-request suggestions
+
+The PR bot's one-click suggestions (`core/suggestions.py`) are built from the real file with the same AST patchers, so a suggested
+line is exactly what the verified patch would write (indentation, comments, markers and multi-line calls preserved). They are not
+built from `finding.evidence`: Bandit's evidence is a numbered multi-line snippet that cannot be pasted back into the code.
+
+* Library pins: one suggestion per pinned line, to the lowest version that fixes every CVE on it. Major jumps and secrets get none.
+* A fix that adds a line (for example `timeout=10,` in a multi-line call) is offered as the previous line plus the new line.
+* A suggestion is only offered where the patcher produced a change; GitHub also requires the line to be part of the PR diff.

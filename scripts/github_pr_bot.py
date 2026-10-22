@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from core.finding import Finding
-from core.suggestions import generate_code_suggestion
+from core.suggestions import generate_code_suggestion, generate_suggestions
 
 log = logging.getLogger("scip.pr_bot")
 COMMENT_MARKER = "<!-- scip-security-bot-summary -->"
@@ -188,6 +188,7 @@ def run_pr_bot(
     findings_file: str | Path,
     enable_comment: bool = True,
     enable_suggestions: bool = True,
+    repo_path: str | Path | None = None,
 ) -> int:
     """Execute the PR review bot against GitHub API."""
     client = GitHubClient(token=token, repo=repo)
@@ -223,11 +224,27 @@ def run_pr_bot(
     if enable_suggestions and findings and commit_sha:
         review_comments: List[Dict[str, Any]] = []
 
+        root = repo_path or os.environ.get("SCIP_SCAN_PATH") or os.environ.get("GITHUB_WORKSPACE") or "."
+        covered: List[tuple] = []
+        try:
+            verified = generate_suggestions(findings, root)       # built from the real files with the AST patchers
+        except Exception as e:
+            log.error(f"Could not build verified suggestions: {e}")
+            verified = []
+        for s in verified:
+            c: Dict[str, Any] = {"path": s.file, "line": s.end_line or s.line, "body": s.to_markdown()}
+            if s.end_line and s.end_line > s.line:
+                c["start_line"] = s.line                          # multi-line suggestion
+            review_comments.append(c)
+            covered.append((s.file, s.line, s.end_line or s.line))
+
         for f in findings:
             if not f.line or f.line < 1:
                 continue
-
-            suggestion = generate_code_suggestion(f)
+            rel = f.file.replace("\\", "/")
+            if any(p == rel and a <= f.line <= z for p, a, z in covered):
+                continue                                          # already has a verified suggestion
+            suggestion = generate_code_suggestion(f, root)
             if suggestion:
                 review_comments.append({
                     "path": suggestion.file,
