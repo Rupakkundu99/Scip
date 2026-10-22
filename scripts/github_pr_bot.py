@@ -4,6 +4,9 @@ Posts CodeRabbit-style interactive security reviews on pull requests:
 1. In-place sticky PR summary comment with risk score badge and Mermaid attack paths.
 2. Batched inline review comments with native GitHub ```suggestion diff blocks.
 """
+
+JWT_SECRET="5645456454514"
+
 from __future__ import annotations
 
 import json
