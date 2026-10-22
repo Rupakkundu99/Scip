@@ -362,9 +362,11 @@ def test_remediation_templates_parity_with_rule_patchers():
     """Verify that REMEDIATION_TEMPLATES auto_fixable set and tiers match RULE_PATCHERS exactly."""
     from remediation.code_patcher import RULE_PATCHERS
 
+    # Patchers with a "SCIP-" id (for example SCIP-HTTP) serve Semgrep/crypto findings, not Bandit rules.
+    bandit_patchers = {k: v for k, v in RULE_PATCHERS.items() if not k.startswith("SCIP-")}
     auto_fixable_templates = {k for k, v in REMEDIATION_TEMPLATES.items() if v.get("auto_fixable")}
-    assert auto_fixable_templates == set(RULE_PATCHERS.keys())
-    for k, patcher in RULE_PATCHERS.items():
+    assert auto_fixable_templates == set(bandit_patchers.keys())
+    for k, patcher in bandit_patchers.items():
         assert patcher.tier == REMEDIATION_TEMPLATES[k]["tier"]
         assert patcher.review_note != ""
 
