@@ -188,3 +188,12 @@ def test_a_secret_in_the_context_of_a_code_fix_is_masked_in_every_report_record(
     from remediation.run import build_code_report
     rep = build_code_report(res, None, [], edit_sources(fs), vals)
     assert SECRET in res.edits[0].original and SECRET not in json.dumps(rep) and "********" in rep["applied"][0]["original"]
+
+
+def test_non_bandit_patchers_are_well_formed_and_do_not_collide_with_bandit_ids():
+    from remediation.code_patcher import RULE_PATCHERS
+    extra = {k: v for k, v in RULE_PATCHERS.items() if k.startswith("SCIP-")}
+    assert "SCIP-HTTP" in extra
+    for k, v in extra.items():
+        assert v.tier in ("mechanical", "needs_review") and v.review_note and v.description
+    assert not any(k.startswith("SCIP-") for k in ("B101", "B113", "B201"))
